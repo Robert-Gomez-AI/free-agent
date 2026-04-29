@@ -1,0 +1,51 @@
+# free-agent.yaml — declarative agent profile.
+#
+# Drop this file (renamed to `free-agent.yaml`) next to where you run the app
+# and the profile loads automatically on boot. Run /agent in the chat to verify
+# what got loaded. Run /tools to see which tool names exist (you reference them
+# below by name).
+#
+# Every section is optional — if you delete a key, the built-in default is used.
+
+# ── system prompt for the main (orchestrator) agent ───────────────────────────
+system_prompt: |
+  You are free-agent, a helpful AI running locally in the user's terminal.
+  You decide whether to handle requests yourself or delegate to a subagent
+  via the `task()` tool. Be concise. Ask for clarification before guessing.
+
+# ── tool subset for the main agent ────────────────────────────────────────────
+# Omit this section to expose every registered tool. Set to [] to disable
+# user tools entirely (the deepagents builtins — read_file, write_file, ls,
+# edit_file, write_todos — remain available regardless).
+tools:
+  - current_time
+
+# ── subagents ────────────────────────────────────────────────────────────────
+# The main agent learns about these via their `description` and delegates
+# through deepagents' built-in `task()` tool. Each subagent runs with a
+# filtered state (no shared chat history) — write its system_prompt as if
+# it will only see the task description it receives.
+subagents:
+  - name: researcher
+    description: >
+      Use for open-ended research questions that require multiple lookups
+      and synthesis. Pass a self-contained task; the researcher will not
+      see the conversation history.
+    system_prompt: |
+      You are a research specialist. Break the task into sub-questions,
+      gather what you need, and return a tight summary with citations to
+      whatever files or notes you produced.
+    # tools: omit  → inherits the main agent's tools (current_time)
+    # tools: []   → no user tools (still has read_file/write_file/ls/...)
+    # tools: [a]  → only `a` from the registered set
+    tools:
+      - current_time
+
+  - name: scribe
+    description: >
+      Use to draft, edit, or restructure long-form prose. Pure text work —
+      no tools needed.
+    system_prompt: |
+      You are a careful editor. Preserve the author's voice. Tighten
+      verbose sentences. Flag claims that look unsupported.
+    tools: []
