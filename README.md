@@ -11,17 +11,26 @@ the chat).
  NET online   MODEL qwen3.5:9b   LINK ollama
 ```
 
+![free-agent in action](images/image.png)
+
 ## What you get
 
 - **Local-first.** Runs against any local Ollama model with tool calling
   (Qwen, Llama 3.1+, Mistral, GLM, ...) or Anthropic's API. Pick per project.
 - **Streaming chat REPL** with cyberpunk styling, slash commands, history,
   Ctrl+C cancel, Ctrl+D quit.
+- **In-chat settings panel.** `/settings` opens your `$EDITOR` with a
+  commented YAML view of every preference (provider, model, API key,
+  temperature, writable mode, …). Save → applied + persisted.
+- **Workspaces.** Each project gets its own profile + tools + skills under
+  `~/.config/free-agent/workspaces/`. Switch with `/ws use <name>`.
 - **Subagents you can author or generate.** Declare them in
   `free-agent.yaml` or run `/sub new` and the LLM drafts the system prompt.
 - **Tools you can author or generate.** Drop a `@tool` function into a
   folder, or run `/tool new` and the LLM writes the Python.
-- **Single-file YAML config**, hot-reloaded from disk with backup.
+- **Persistent config.** `/settings` and `/model use` write to
+  `~/.config/free-agent/settings.json` (and `secrets.json`, mode `0600`,
+  for API keys). Real env vars still override for one-off CI runs.
 - **Three-layer architecture** (CLI · agent · infrastructure) so you can swap
   the rendering, the model backend, or the tool registry without touching the
   rest.
@@ -35,16 +44,26 @@ uv tool install --from git+https://github.com/Robert-Gomez-AI/free-agent free-ag
 free-agent          # available globally — run from any project directory
 ```
 
-The CLI reads its config **relative to the cwd** where you launch it:
+**First run** auto-creates a `default` workspace at
+`~/.config/free-agent/workspaces/default/` and starts the chat. From there
+type `/settings` to pick your provider and model.
 
-| File | Purpose |
+Config lives in two places:
+
+| Location | Purpose |
 |---|---|
-| `.env` | provider + API keys (see `.env.example`) |
-| `free-agent.yaml` | optional — main agent prompt, tool subset, subagents |
-| `free_agent_tools/*.py` | optional — your custom tools, auto-loaded |
+| `~/.config/free-agent/settings.json` | non-secret prefs (provider, model, temp, max_tokens, writable) — written by `/settings` and `/model use` |
+| `~/.config/free-agent/secrets.json` | API keys (mode `0600`) — written by `/settings` |
+| `~/.config/free-agent/workspaces/<name>/free-agent.yaml` | per-workspace agent profile (system prompt, tools subset, subagents) |
+| `~/.config/free-agent/workspaces/<name>/tools/*.py` | per-workspace `@tool` functions, auto-loaded |
+| `~/.config/free-agent/workspaces/<name>/skills/<name>/SKILL.md` | per-workspace deepagents skills |
+| `~/.config/free-agent/tools/*.py` | **global** tools — loaded in every workspace |
+| `~/.config/free-agent/skills/<name>/SKILL.md` | **global** skills — loaded in every workspace |
+| `./.env` (cwd) | optional — directory-local defaults; loses to `settings.json` |
 
-So a typical workflow is `cd ~/projects/some-project && free-agent` and that
-project's config + tools come along automatically.
+Switch workspaces with `/ws use <name>` — profile, tools, and skills all
+swap together. Real env vars (`export ANTHROPIC_API_KEY=...; free-agent`)
+still override the JSON files for one-off / CI scenarios.
 
 To upgrade later: `uv tool upgrade free-agent`. To remove:
 `uv tool uninstall free-agent`.
@@ -57,9 +76,13 @@ Use GitHub's "Use this template" button, or:
 git clone https://github.com/Robert-Gomez-AI/free-agent
 cd free-agent
 uv sync
-cp .env.example .env          # set your provider
 uv run free-agent
+# inside the chat, type /settings to pick provider + model + API key
 ```
+
+`.env.example` is still around for users who prefer env-var workflows
+(`cp .env.example .env`) or CI pipelines, but the `/settings` panel is the
+recommended path.
 
 If you fork, customizing the package itself is fair game — rename it in
 `pyproject.toml`, swap the cyberpunk banner in `cli/console.py`, replace the
@@ -96,7 +119,10 @@ When enabled:
 
 ## Pick a model provider
 
-Set `FREE_AGENT_PROVIDER` in `.env`. Defaults to `ollama`.
+Easiest path: launch `free-agent`, type `/settings`, edit the YAML, save.
+Persisted to `~/.config/free-agent/settings.json` so the next session boots
+into your choice. Or set `FREE_AGENT_PROVIDER` / `ANTHROPIC_API_KEY` env
+vars for the same effect (env wins over the JSON files).
 
 ### Ollama (local, open-source) — default
 
@@ -114,11 +140,8 @@ Set `FREE_AGENT_PROVIDER` in `.env`. Defaults to `ollama`.
    # also good: llama3.1:8b · mistral-nemo · hermes3 · command-r
    ```
    …or pull from inside the chat with `/model pull qwen3.5:9b` (see below).
-3. In `.env`:
-   ```
-   FREE_AGENT_PROVIDER=ollama
-   FREE_AGENT_OLLAMA_MODEL=qwen3.5:9b
-   ```
+3. From inside the chat, `/settings` → set `provider: ollama` and
+   `ollama_model: qwen3.5:9b`. Save and quit your editor.
 
 The boot sequence does a preflight against Ollama and lists what you have if
 the configured model isn't pulled — so a misconfigured model fails fast with
@@ -136,7 +159,9 @@ chat to pull or switch models:
 /model browse qwen      ← filter by substring (name + description + sizes + caps)
 /model browse refresh   ← bypass the 6h cache and re-scrape
 /model pull qwen3:14b   ← download with live progress; offers to switch on success
-/model use qwen3:14b    ← switch active model in-session (rebuilds the agent)
+/model use              ← interactive picker: numbered Ollama-pulled + Anthropic catalog
+/model use qwen3:14b    ← switch by name (rebuilds the agent + persists choice)
+/model use claude-opus-4-7  ← cross-provider switch: auto-flips to Anthropic
 /model rm gemma2:27b    ← delete a local model (refuses if it's the active one)
 ```
 
@@ -165,19 +190,45 @@ the command falls back to a small curated catalog at
 `src/free_agent/agent/ollama_catalog.py` so you still get something to pick
 from offline.
 
-`/model use` checks that the model is pulled — if not, it offers to pull it
-first. Switching rebuilds the deepagents graph in place; conversation history
-survives. Reverts cleanly if the new model fails preflight.
+`/model use <name>` is smart about provider:
 
-These commands only apply to Ollama. With `FREE_AGENT_PROVIDER=anthropic`,
-only `/model use <name>` works (cloud models are always available).
+- **Ollama target & not pulled** → offers to pull first.
+- **Name starts with `claude-`** → treated as Anthropic. Auto-flips
+  `provider: anthropic`, validates the API key is configured, rebuilds.
+- **No argument** → opens an interactive picker showing every locally-pulled
+  Ollama model + the curated Anthropic catalog (with a `▶` marker on the
+  active one and a hint when an Anthropic row needs an API key).
+
+Switching rebuilds the deepagents graph in place; conversation history
+survives. Reverts cleanly if the new model fails preflight. The chosen
+provider + model is persisted to `~/.config/free-agent/settings.json`, so
+the next session boots into whatever you last picked.
+
+`/model browse`, `/model pull`, `/model rm`, `/model list` only apply to
+Ollama (cloud catalogs aren't browsed/pulled). `/model use` works for both.
 
 ### Anthropic (cloud)
 
+From inside the chat: `/settings` and edit:
+
+```yaml
+provider: anthropic
+anthropic_api_key: sk-ant-api03-...     # paste, save, file is mode 0600
+anthropic_model: claude-sonnet-4-6      # or claude-opus-4-7 / claude-haiku-4-5-20251001
 ```
-FREE_AGENT_PROVIDER=anthropic
-ANTHROPIC_API_KEY=sk-ant-...
-FREE_AGENT_ANTHROPIC_MODEL=claude-sonnet-4-6
+
+The key is written to `~/.config/free-agent/secrets.json` (mode `0600`,
+never appears in the YAML body — the panel shows it masked as
+`sk-ant-…1234`). Once set, `/model use claude-opus-4-7` works from any
+session, even if you started in Ollama.
+
+CI / one-off override path (env vars still win over the JSON files):
+
+```bash
+export FREE_AGENT_PROVIDER=anthropic
+export ANTHROPIC_API_KEY=sk-ant-...
+export FREE_AGENT_ANTHROPIC_MODEL=claude-sonnet-4-6
+free-agent
 ```
 
 ## Bring your own tools
@@ -187,16 +238,18 @@ A tool is a Python function decorated with `@tool` from
 
 | Location | Scope | Use it for |
 |---|---|---|
-| `./free_agent_tools/*.py` | **project** — only loaded when running `free-agent` from this dir | tools with project-specific assumptions, versioned with the repo |
-| `~/.config/free-agent/tools/*.py` | **global** — loaded from anywhere | tools you want available always (web search, weather, your personal helpers) |
+| `~/.config/free-agent/workspaces/<active>/tools/*.py` | **workspace** — only loaded for this workspace | tools tied to a specific project / context |
+| `~/.config/free-agent/tools/*.py` | **global** — loaded in every workspace | tools you want available always (web search, weather, your personal helpers) |
 
-If a tool with the same name exists in both, **project wins**. The shipped
-`current_time` tool is overridable too.
+If a tool with the same name exists in both, **workspace wins**. The shipped
+`current_time` tool is overridable too. Run `/tool open` from the chat to
+open the active workspace's tools folder in your file manager, or
+`/tool dir` to print the paths.
 
 Drop a file in either directory:
 
 ```python
-# ./free_agent_tools/weather.py
+# ~/.config/free-agent/tools/weather.py   (or the workspace tools/ folder)
 import urllib.request
 from langchain_core.tools import tool
 
@@ -210,8 +263,8 @@ def weather(city: str) -> str:
         return f"weather lookup failed: {e}"
 ```
 
-Run `free-agent` (or `/tool reload` from inside the chat) and it's live.
-Verify with `/tools`.
+Type `/tool reload` inside the chat (or restart) and it's live. Verify with
+`/tools`.
 
 **Three sample tools** are checked in at [`examples/tools/`](examples/tools/)
 showing the patterns you'll use most:
@@ -220,7 +273,7 @@ showing the patterns you'll use most:
 - **AST-based calculator** (no `eval`) for safe input
 - **Filesystem search** scoped to the cwd
 
-Copy them into `./free_agent_tools/` to enable.
+Copy them into your workspace's `tools/` folder (or the global one) to enable.
 
 ### The `@tool` contract
 
@@ -252,9 +305,9 @@ If you don't want to write boilerplate, run `/tool new` from the chat:
 ▓▒░ accept this draft? [Y]es / [r]egenerate / [n]o ▶ y
 
 » where should this tool live?
-   Project  → ./free_agent_tools          (only this directory)
-   Global   → ~/.config/free-agent/tools  (every directory)
-▓▒░ scope [P/g] ▶ g
+   Workspace → ~/.config/free-agent/workspaces/<active>/tools  (active workspace only)
+   Global    → ~/.config/free-agent/tools                      (every workspace)
+▓▒░ scope [W/g] ▶ g
 » tool random_pick registered → ~/.config/free-agent/tools/random_pick.py
 ```
 
@@ -269,7 +322,7 @@ matching the chosen name before saving, then hot-reloads the registry.
 |---|---|
 | `/tool new`        | wizard: name → description → args → goal → LLM draft → save |
 | `/tool rm <name>`  | delete a user tool file (built-ins refuse) and rebuild |
-| `/tool reload`     | re-scan `./free_agent_tools/` after editing files by hand |
+| `/tool reload`     | re-scan workspace + global tool folders after editing files by hand |
 | `/tool list` / `/tools` | inventory grouped by **PKG** (built-in) and **USER** (file-loaded) |
 
 ## Bring your own skills
@@ -309,10 +362,10 @@ Two scopes (mirroring the tools layout):
 
 | Location | Scope |
 |---|---|
-| `./free_agent_skills/<name>/SKILL.md` | **project** — only when running from this dir |
-| `~/.config/free-agent/skills/<name>/SKILL.md` | **global** — every directory |
+| `~/.config/free-agent/workspaces/<active>/skills/<name>/SKILL.md` | **workspace** — only loaded for this workspace |
+| `~/.config/free-agent/skills/<name>/SKILL.md` | **global** — loaded in every workspace |
 
-Project takes precedence on name collision. Two ready-to-use samples ship at
+Workspace takes precedence on name collision. Two ready-to-use samples ship at
 [`examples/skills/`](examples/skills/) — `code-review` and `web-research`.
 
 ```bash
@@ -505,8 +558,15 @@ progresses.
 /model list        list local Ollama models
 /model browse [q]  curated catalog of pullable models (filter optional)
 /model pull <name> download a model (live progress)
-/model use <name>  switch active model
+/model use [name]  switch active model — no name opens an interactive picker
 /model rm <name>   remove a local model
+/settings          edit provider · model · API key · temperature · writable in $EDITOR
+/ws list           list workspaces (▶ marks the active one)
+/ws use <name>     switch active workspace (reloads profile + tools + skills)
+/ws new <name>     create an empty workspace
+/ws clone <s> <d>  duplicate a workspace
+/ws rm <name>      delete a workspace (refuses active or last)
+/ws open           open the active workspace folder in your file manager
 /clear             wipe the conversation buffer (keeps the agent loaded)
 /history           dump the session as markdown
 /save [path]       export to file
@@ -524,23 +584,30 @@ LangChain types; the agent layer is the only place that touches `deepagents`.
 ```
 src/free_agent/
 ├── __main__.py           # entrypoint: load .env, start the async loop
-├── config.py             # pydantic-settings — provider, keys, model
+├── config.py             # pydantic-settings — JSON + env merge with priority
+├── workspace.py          # ~/.config/free-agent/workspaces/* lifecycle
 ├── agent/
 │   ├── builder.py        # the only file that imports deepagents
 │   ├── profile.py        # AgentProfile / SubAgentProfile (Pydantic)
 │   ├── loader.py         # free-agent.yaml → AgentProfile (with save)
-│   └── prompts.py        # default system prompt fallback
+│   ├── prompts.py        # default system prompt fallback
+│   ├── skills_registry.py # discover SKILL.md folders (project + global)
+│   ├── ollama_admin.py   # list/pull/delete via Ollama HTTP API
+│   ├── ollama_catalog.py # curated fallback list
+│   └── ollama_library.py # scrape ollama.com/library with cache
 ├── tools/
 │   ├── basic.py          # BUILTIN_TOOLS — what ships with the package
-│   ├── registry.py       # TOOLS (mutable) + reload from ./free_agent_tools/
+│   ├── registry.py       # TOOLS (mutable) + reload from workspace + global dirs
 │   └── __init__.py       # public surface
 ├── session/
 │   └── history.py        # plain-dataclass conversation state
 └── cli/
     ├── app.py            # async event loop
-    ├── console.py        # cyberpunk theme + glitch boot animation
-    ├── commands.py       # slash dispatch
-    ├── wizard.py         # /sub new + /tool new (LLM-driven)
+    ├── console.py        # cyberpunk theme + glitch boot + model picker
+    ├── commands.py       # slash dispatch (/model, /settings, /ws, /sub, …)
+    ├── settings_panel.py # /settings → YAML in $EDITOR → validate → persist
+    ├── wizard.py         # /sub new + /tool new + /skill new (LLM-driven)
+    ├── slash_registry.py # tab-completion for slash commands
     └── context.py        # SessionContext bundle
 ```
 

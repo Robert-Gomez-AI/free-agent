@@ -311,6 +311,73 @@ def _human_modified(value: Any) -> str:
     return s
 
 
+def render_model_picker(
+    console: Console,
+    items: list[dict[str, Any]],
+    *,
+    active_name: str,
+    active_provider: str,
+) -> None:
+    """Render a numbered picker — one row per selectable model.
+
+    Each `items[i]` must contain:
+      - index:    1-based number the user types to pick
+      - name:     model id (e.g. `claude-opus-4-7` or `qwen3.5:9b`)
+      - provider: "anthropic" | "ollama"
+      - note:     short right-side hint (size, "curated", "needs api key", …)
+      - enabled:  bool — disabled rows still show but warn on pick
+    """
+    from rich.console import Group
+    from rich.table import Table
+
+    sections: list[Any] = []
+    sections.append(Text())
+
+    grid = Table.grid(padding=(0, 2))
+    grid.add_column(style="bold bright_magenta", no_wrap=True)  # number
+    grid.add_column(style="bold bright_cyan", no_wrap=True)     # arrow marker
+    grid.add_column(no_wrap=True)                                # provider tag
+    grid.add_column(no_wrap=True)                                # name
+    grid.add_column(style="grey50")                              # note
+
+    provider_styles = {
+        "anthropic": "bold bright_magenta",
+        "ollama":    "bold bright_green",
+    }
+
+    for it in items:
+        is_active = it["name"] == active_name and it["provider"] == active_provider
+        marker = "▶" if is_active else " "
+        prov_style = provider_styles.get(it["provider"], "white")
+        name_style = "bold yellow1" if it.get("enabled", True) else "grey50"
+        grid.add_row(
+            f"  [{it['index']}]",
+            marker,
+            Text(f"{it['provider']:<10}", style=prov_style),
+            Text(it["name"], style=name_style),
+            it.get("note", ""),
+        )
+
+    sections.append(grid)
+    sections.append(Text())
+    sections.append(
+        Text(
+            "  type a number to switch · [enter] cancels",
+            style="grey50",
+        )
+    )
+
+    console.print(
+        Panel(
+            Group(*sections),
+            border_style="bright_cyan",
+            title="[tag.cyan] ▓▒░ PICK A MODEL ░▒▓ [/]",
+            title_align="left",
+            padding=(0, 2),
+        )
+    )
+
+
 def render_model_library(
     console: Console,
     entries: list[Any],
@@ -526,15 +593,15 @@ def render_tools_inventory(
     # ── tools loaded from disk (project or global) ────────────────────────
     from free_agent.tools import global_tools_dir, user_tools_dir
 
-    project_dir = user_tools_dir()
+    workspace_dir = user_tools_dir()
     global_dir = global_tools_dir()
 
     def _scope_label(path: Any) -> str:
         if path is None:
             return ""
         try:
-            if path.is_relative_to(project_dir):
-                return "project"
+            if path.is_relative_to(workspace_dir):
+                return "workspace"
             if path.is_relative_to(global_dir):
                 return "global"
         except (ValueError, AttributeError):
@@ -545,7 +612,7 @@ def render_tools_inventory(
     header = Text()
     header.append(" ▰ USER ", style="tag.cyan")
     header.append(
-        f"  project={project_dir}  ·  global={global_dir}",
+        f"  workspace={workspace_dir}  ·  global={global_dir}",
         style="grey50",
     )
     sections.append(header)

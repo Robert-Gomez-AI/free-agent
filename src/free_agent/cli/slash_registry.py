@@ -44,6 +44,18 @@ SLASH_COMMANDS: list[tuple[str, str]] = [
     ("/model use",    "switch active model: /model use <name>"),
     ("/model rm",     "remove a local model: /model rm <name>"),
 
+    ("/writable",     "toggle real-disk mode: /writable [on|off|<path>]"),
+    ("/settings",     "open the full-screen settings panel"),
+
+    ("/ws list",      "list workspaces (active marker)"),
+    ("/ws current",   "show active workspace details"),
+    ("/ws new",       "create a workspace: /ws new <name>"),
+    ("/ws clone",     "duplicate a workspace: /ws clone <src> <dst>"),
+    ("/ws use",       "switch active workspace: /ws use <name>"),
+    ("/ws rm",        "delete a workspace: /ws rm <name>"),
+    ("/ws open",      "open the active workspace folder"),
+    ("/ws dir",       "print active workspace path"),
+
     ("/clear",        "wipe the conversation buffer"),
     ("/history",      "dump the session as markdown"),
     ("/save",         "export session: /save [path]"),
@@ -81,13 +93,28 @@ def _skill_names(ctx: "SessionContext") -> Iterable[tuple[str, str]]:
     return ((s.name, f"{s.scope} · {_truncate(s.description, 50)}") for s in list_skills())
 
 
+def _workspace_names(ctx: "SessionContext") -> Iterable[tuple[str, str]]:
+    from free_agent.workspace import list_workspaces
+
+    out: list[tuple[str, str]] = []
+    for ws in list_workspaces():
+        meta = "active" if ws.name == ctx.workspace.name else str(ws.root)
+        out.append((ws.name, _truncate(meta, 60)))
+    return out
+
+
 _DYNAMIC: dict[str, _DynamicProvider] = {
-    "/sub rm ":      _subagent_names,
-    "/sub remove ":  _subagent_names,
-    "/tool rm ":     _user_tool_names,
-    "/tool remove ": _user_tool_names,
-    "/skill rm ":    _skill_names,
+    "/sub rm ":       _subagent_names,
+    "/sub remove ":   _subagent_names,
+    "/tool rm ":      _user_tool_names,
+    "/tool remove ":  _user_tool_names,
+    "/skill rm ":     _skill_names,
     "/skill remove ": _skill_names,
+    "/ws use ":       _workspace_names,
+    "/ws rm ":        _workspace_names,
+    "/ws clone ":     _workspace_names,
+    "/workspace use ": _workspace_names,
+    "/workspace rm ":  _workspace_names,
 }
 
 

@@ -3,6 +3,13 @@
 `TOOLS` is the single list every other module reads from. It's mutated
 in place by `reload_tools()` so existing references stay valid after
 the user creates or removes a tool through the wizard.
+
+Discovery sources (in order, later overrides earlier on name collision):
+    1. built-in tools shipped with the package
+    2. global   — ~/.config/free-agent/tools/*.py
+    3. workspace — <active workspace>/tools/*.py
+
+Workspaces replaced the previous cwd-based `./free_agent_tools/` source.
 """
 from __future__ import annotations
 
@@ -14,10 +21,13 @@ from pathlib import Path
 from langchain_core.tools import BaseTool
 
 from free_agent.tools.basic import BUILTIN_TOOLS
+from free_agent.workspace import active as _active_workspace
 
 log = logging.getLogger(__name__)
 
-USER_TOOLS_DIRNAME = "free_agent_tools"
+# Kept for back-compat with /tool open & error messages — no longer the
+# discovery source (the active workspace is).
+USER_TOOLS_DIRNAME = "tools"
 GLOBAL_TOOLS_PATH = Path.home() / ".config" / "free-agent" / "tools"
 _USER_MODULE_PREFIX = "free_agent_user_tools"
 
@@ -26,6 +36,11 @@ TOOLS: list[BaseTool] = []
 
 # tool name → file it came from. None for built-ins.
 _origins: dict[str, Path | None] = {}
+
+# path → captured exception text from the last reload that failed to import it.
+# Wizards read this to surface the *actual* error to the user instead of a
+# generic "no @tool found" message.
+_load_errors: dict[Path, str] = {}
 
 # Tools that deepagents adds automatically via its default middleware stack
 # (FilesystemMiddleware + TodoListMiddleware).
@@ -39,29 +54,47 @@ DEEPAGENTS_BUILTINS: list[tuple[str, str]] = [
 
 
 def user_tools_dir() -> Path:
-    """Project-local user tool directory (relative to cwd)."""
-    return Path.cwd() / USER_TOOLS_DIRNAME
+    """Active workspace's tools directory (per-workspace, no longer cwd-based)."""
+    ws = _active_workspace()
+    if ws is None:
+        # Fallback for callers that run before the workspace is bound (eg.
+        # boot-time module load). Returns a non-existent placeholder; the
+        # discovery walk skips missing directories.
+        return GLOBAL_TOOLS_PATH.parent / "workspaces" / "_unbound" / "tools"
+    return ws.tools_dir
 
 
 def global_tools_dir() -> Path:
-    """User-global tool directory — loaded regardless of cwd."""
+    """User-global tool directory — loaded regardless of active workspace."""
     return GLOBAL_TOOLS_PATH
 
 
 def reload_tools() -> list[str]:
     """Re-discover all tools. Mutates TOOLS in place.
 
-    Discovery order:
-      1. Built-in (shipped with the package)
-      2. Global   (~/.config/free-agent/tools/*.py)
-      3. Project  (./free_agent_tools/*.py)
+    Discovery order (later sources override earlier ones on name collision):
+      1. Built-in   (shipped with the package)
+      2. Global     (~/.config/free-agent/tools/*.py)
+      3. Workspace  (<active workspace>/tools/*.py)
 
-    Later sources override earlier ones on name collision (so a project tool
-    can shadow a global tool with the same name). Returns the names of
-    user-sourced tools that loaded successfully.
+    Returns the names of file-sourced tools that loaded successfully.
     """
-    by_name: dict[str, BaseTool] = {t.name: t for t in BUILTIN_TOOLS}
-    origins: dict[str, Path | None] = {t.name: None for t in BUILTIN_TOOLS}
+    # Re-import the package's built-in tool module so edits to basic.py
+    # (e.g. tightening a schema) are picked up by /tool reload without a
+    # full process restart. No-op on first load.
+    import importlib
+
+    from free_agent.tools import basic as _basic_module
+
+    try:
+        importlib.reload(_basic_module)
+    except Exception as exc:
+        log.warning("could not reload tools.basic: %s", exc)
+    builtins = getattr(_basic_module, "BUILTIN_TOOLS", BUILTIN_TOOLS)
+
+    by_name: dict[str, BaseTool] = {t.name: t for t in builtins}
+    origins: dict[str, Path | None] = {t.name: None for t in builtins}
+    _load_errors.clear()
 
     for source in (global_tools_dir(), user_tools_dir()):
         if not source.is_dir():
@@ -72,6 +105,13 @@ def reload_tools() -> list[str]:
             try:
                 discovered = _load_tools_from_file(path)
             except Exception as exc:
+                # Capture both for terse log + verbose surfacing in wizards.
+                import traceback as _tb
+
+                _load_errors[path.resolve()] = (
+                    f"{type(exc).__name__}: {exc}\n"
+                    + "".join(_tb.format_exception(type(exc), exc, exc.__traceback__))
+                )
                 log.warning("failed to load tool file %s: %s", path, exc)
                 continue
             for tool in discovered:
@@ -89,6 +129,11 @@ def reload_tools() -> list[str]:
     _origins.clear()
     _origins.update(origins)
     return [name for name, origin in origins.items() if origin is not None]
+
+
+def last_load_error(path: Path) -> str | None:
+    """Return the last import-error trace captured for `path`, if any."""
+    return _load_errors.get(path.resolve())
 
 
 def origin_of(name: str) -> Path | None:

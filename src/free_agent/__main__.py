@@ -18,7 +18,8 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="free-agent",
         description=(
             "Terminal chat with a local agent built on LangChain deepagents. "
-            "Reads .env, free-agent.yaml, and ./free_agent_tools/*.py from the cwd."
+            "Profile + tools + skills come from the active workspace under "
+            "~/.config/free-agent/workspaces/. Switch with /ws use <name>."
         ),
     )
     p.add_argument(
@@ -35,7 +36,20 @@ def _build_parser() -> argparse.ArgumentParser:
         "-c",
         "--config",
         metavar="PATH",
-        help="Path to an agent profile YAML (defaults to ./free-agent.yaml if present).",
+        help=(
+            "Path to an agent profile YAML — overrides whatever the active "
+            "workspace ships."
+        ),
+    )
+    p.add_argument(
+        "--workspace",
+        "--ws",
+        metavar="NAME",
+        dest="workspace",
+        help=(
+            "Use this workspace for the session (default: the persisted "
+            "active workspace, or auto-created `default` on first run)."
+        ),
     )
     p.add_argument(
         "--version",
@@ -67,7 +81,13 @@ def main() -> int:
     )
 
     try:
-        return asyncio.run(run(settings, config_override=config_override))
+        return asyncio.run(
+            run(
+                settings,
+                config_override=config_override,
+                workspace_override=args.workspace,
+            )
+        )
     except KeyboardInterrupt:
         return 130
 

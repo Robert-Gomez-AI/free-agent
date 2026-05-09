@@ -6,6 +6,7 @@ import yaml
 from pydantic import ValidationError
 
 from free_agent.agent.profile import AgentProfile
+from free_agent.workspace import active as _active_workspace
 
 CONFIG_FILENAME = "free-agent.yaml"
 
@@ -15,7 +16,7 @@ def find_config(explicit: str | Path | None = None) -> Path | None:
 
     Order:
         1. `explicit` argument (raises if missing)
-        2. `./free-agent.yaml` in the current working directory
+        2. `<active workspace>/free-agent.yaml`
         3. None — caller falls back to built-in defaults
     """
     if explicit:
@@ -23,8 +24,10 @@ def find_config(explicit: str | Path | None = None) -> Path | None:
         if not p.exists():
             raise FileNotFoundError(f"agent config not found: {p}")
         return p
-    cwd = Path.cwd() / CONFIG_FILENAME
-    return cwd if cwd.exists() else None
+    ws = _active_workspace()
+    if ws is not None and ws.config_file.exists():
+        return ws.config_file
+    return None
 
 
 def load_profile(path: Path | None) -> AgentProfile:
@@ -50,11 +53,22 @@ def load_profile(path: Path | None) -> AgentProfile:
 def save_profile(path: Path | None, profile: AgentProfile) -> Path:
     """Serialize the profile back to YAML.
 
-    Writes to `path`, defaulting to ./free-agent.yaml. If the target exists
-    its contents are first copied to a `.bak` sibling. Comments in the
-    original file are NOT preserved — the YAML is re-emitted from scratch.
+    Writes to `path`, defaulting to the active workspace's free-agent.yaml.
+    If the target exists, its contents are first copied to a `.bak` sibling.
+    Comments in the original file are NOT preserved — the YAML is re-emitted
+    from scratch.
     """
-    target = path if path is not None else Path.cwd() / CONFIG_FILENAME
+    if path is not None:
+        target = path
+    else:
+        ws = _active_workspace()
+        if ws is None:
+            raise RuntimeError(
+                "no active workspace bound — cannot save profile (call ensure_default first)"
+            )
+        target = ws.config_file
+
+    target.parent.mkdir(parents=True, exist_ok=True)
 
     # `exclude_none=True` drops the optional fields (system_prompt=None,
     # tools=None) so they round-trip cleanly: a subagent with tools=None

@@ -14,6 +14,14 @@ from rich.console import Console
 from free_agent.agent.builder import build_session
 from free_agent.agent.loader import find_config, load_profile
 from free_agent.cli.commands import SlashResult, handle_slash_command
+from free_agent.tools import reload_tools
+from free_agent.workspace import (
+    Workspace,
+    bind_active,
+    ensure_default,
+    get_workspace,
+    set_active,
+)
 from free_agent.cli.console import (
     boot_progress,
     end_stream,
@@ -62,7 +70,12 @@ PROMPT_FRAGMENT = HTML(
 )
 
 
-async def run(settings: Settings, *, config_override: "Path | None" = None) -> int:
+async def run(
+    settings: Settings,
+    *,
+    config_override: "Path | None" = None,
+    workspace_override: str | None = None,
+) -> int:
     from pathlib import Path
 
     console = make_console()
@@ -75,7 +88,26 @@ async def run(settings: Settings, *, config_override: "Path | None" = None) -> i
     # turn the flag into a concrete root directory the agent is allowed to touch.
     writable_root: Path | None = Path.cwd().resolve() if settings.writable else None
 
-    # Load the (optional) agent profile from free-agent.yaml.
+    # Resolve the active workspace BEFORE loading profile/tools/skills, since
+    # those loaders read from the workspace.
+    try:
+        workspace = _resolve_workspace(workspace_override)
+        bind_active(workspace)
+        # Re-discover tools now that the workspace pointer is set (the
+        # boot-time call in tools/registry.py only saw the global dir).
+        reload_tools()
+    except (ValueError, OSError) as exc:
+        await type_boot_line(console, " HALT ", "workspace setup failed.", ok=False)
+        render_error(console, str(exc))
+        return 1
+
+    await type_boot_line(
+        console,
+        "  WS  ",
+        f"workspace active → {workspace.name} ({workspace.root})",
+    )
+
+    # Load the (optional) agent profile from the workspace.
     try:
         config_path = find_config(config_override)
         profile = load_profile(config_path)
@@ -119,14 +151,38 @@ async def run(settings: Settings, *, config_override: "Path | None" = None) -> i
     console.print()
 
     # Box that holds the SessionContext so the completer (built before the
-    # context exists) can resolve it lazily for dynamic argument completion.
+    # context exists) can resolve it lazily for dynamic argument completion,
+    # and so the bottom toolbar / F2 keybinding can read live state.
     ctx_box: list[SessionContext | None] = [None]
+
+    def _bottom_toolbar() -> HTML:
+        ctx = ctx_box[0]
+        if ctx is None:
+            return HTML("")
+        ws = ctx.workspace.name
+        model = ctx.settings.active_model
+        provider = ctx.settings.provider
+        if ctx.writable_root is not None:
+            wrt = (
+                '<style fg="ansired" bg="default"><b>WRT</b></style> '
+                f'<style fg="ansibrightblack">{ctx.writable_root}</style>'
+            )
+        else:
+            wrt = '<style fg="ansigreen"><b>RO</b></style> <style fg="ansibrightblack">virtual fs</style>'
+        return HTML(
+            f' <b>ws</b>:<style fg="ansimagenta">{ws}</style> · '
+            f'<b>{model}</b><style fg="ansibrightblack">@{provider}</style> · '
+            f'{wrt} · '
+            f'<style fg="ansibrightblack">/settings · /ws · ctrl+d quit</style> '
+        )
 
     session: PromptSession[str] = PromptSession(
         history=FileHistory(str(settings.history_file)),
         style=PROMPT_STYLE,
         completer=SlashCompleter(ctx_provider=lambda: ctx_box[0]),
         complete_while_typing=True,
+        bottom_toolbar=_bottom_toolbar,
+        refresh_interval=1.0,
     )
     ctx = SessionContext(
         conversation=Conversation(),
@@ -135,6 +191,7 @@ async def run(settings: Settings, *, config_override: "Path | None" = None) -> i
         chat_model=chat_model,
         agent=agent,
         prompt_session=session,
+        workspace=workspace,
         config_path=config_path,
         writable_root=writable_root,
     )
@@ -175,6 +232,25 @@ async def run(settings: Settings, *, config_override: "Path | None" = None) -> i
         await _attempt_turn(ctx.agent, ctx.conversation, console)
 
 
+def _resolve_workspace(name_override: str | None) -> Workspace:
+    """Pick the workspace to activate at boot.
+
+    If `name_override` is given, that workspace must exist (no auto-create
+    to avoid typo-creating accidental workspaces). Otherwise, fall back to
+    the persisted active workspace, or the migrated `default` on first run.
+    """
+    if name_override:
+        ws = get_workspace(name_override)
+        if ws is None:
+            raise ValueError(
+                f"workspace {name_override!r} does not exist. "
+                "create it with /ws new or omit --workspace to use the default."
+            )
+        set_active(ws.name)
+        return ws
+    return ensure_default(migrate_cwd=True)
+
+
 async def _attempt_turn(
     agent: Any,
     conversation: Conversation,
@@ -202,7 +278,12 @@ async def _attempt_turn(
     except Exception as exc:
         log.exception("turn failed")
         console.print()
-        render_error(console, str(exc))
+        # Show the exception class and message — bare str(exc) is often empty
+        # for langchain validation / pydantic / parser errors, and the user
+        # then has nothing actionable to copy back.
+        exc_label = type(exc).__name__
+        exc_msg = str(exc) or "(no message — check the stderr log for the full trace)"
+        render_error(console, f"[{exc_label}] {exc_msg}")
         if conversation.messages and conversation.messages[-1]["role"] == "user":
             conversation.pop_last()
         return None
@@ -218,7 +299,7 @@ _PLAN_MAX_STEPS = 4  # initial turn + up to 3 auto-continues
 
 async def _run_planning_loop(ctx: SessionContext, console: Console) -> None:
     """Run an initial /plan turn, then auto-continue while pending todos remain."""
-    from free_agent.cli.commands import CONTINUE_DIRECTIVE
+    from free_agent.cli.commands import format_continue_directive
 
     previous_todos: list[dict[str, Any]] | None = None
     for step in range(_PLAN_MAX_STEPS):
@@ -253,14 +334,14 @@ async def _run_planning_loop(ctx: SessionContext, console: Console) -> None:
             )
             return
 
-        # Inject the continue directive and loop.
+        # Inject the continue directive (with current plan snapshot) and loop.
         render_info(
             console,
             f"[bold bright_magenta]auto-continue[/] "
             f"({step + 1}/{_PLAN_MAX_STEPS - 1})  ·  "
             f"{len(unfinished)} todo(s) still open",
         )
-        ctx.conversation.append_user(CONTINUE_DIRECTIVE)
+        ctx.conversation.append_user(format_continue_directive(latest))
 
 
 def _todos_equal(a: list[dict[str, Any]], b: list[dict[str, Any]]) -> bool:
@@ -300,16 +381,64 @@ async def _stream_turn(
     from rich.padding import Padding
 
     payload = conversation.to_payload()
-    chunks: list[str] = []
 
-    state: dict[str, Any] = {"live": None, "buffer": [], "latest_todos": None}
+    from rich.text import Text
+
+    state: dict[str, Any] = {
+        "live": None,
+        "buffer": [],
+        "latest_todos": None,
+        "cleaned_segments": [],
+        # Reasoning channel (gpt-oss / qwen3 / deepseek-r1 emit it separately
+        # via additional_kwargs.reasoning_content). Rendered as dim italic
+        # text in its own Live region so the user sees what the model is
+        # thinking before the actual answer arrives.
+        "reasoning_live": None,
+        "reasoning_buffer": [],
+    }
 
     def _renderable(text: str) -> Padding:
         return Padding(Markdown(text or " "), (0, 0, 0, 2))
 
+    def _reasoning_renderable(text: str) -> Padding:
+        # Plain Text (not Markdown) so the model's raw reasoning isn't
+        # interpreted as headers / lists. Dim grey + italic so it's clearly
+        # the model's internal monologue, not the answer.
+        body = Text(text or " ", style="italic grey50")
+        return Padding(body, (0, 0, 0, 4))
+
+    def _begin_reasoning_section() -> None:
+        if state["reasoning_live"] is not None:
+            return
+        console.print()
+        console.print(
+            Padding(Text("◇ thinking", style="italic grey50"), (0, 0, 0, 2))
+        )
+        state["reasoning_buffer"] = []
+        live = Live(
+            _reasoning_renderable(""),
+            console=console,
+            refresh_per_second=10,
+            transient=False,
+            vertical_overflow="visible",
+        )
+        live.__enter__()
+        state["reasoning_live"] = live
+
+    def _end_reasoning_section() -> None:
+        live = state["reasoning_live"]
+        if live is None:
+            return
+        text = "".join(state["reasoning_buffer"]).strip()
+        live.update(_reasoning_renderable(text or " "))
+        live.__exit__(None, None, None)
+        state["reasoning_live"] = None
+
     def _begin_section() -> None:
         if state["live"] is not None:
             return
+        # Close any open reasoning section first — content is the final answer.
+        _end_reasoning_section()
         # Prefix goes on its own line above the Live region.
         render_assistant_prefix(console)
         console.print()
@@ -338,6 +467,8 @@ async def _stream_turn(
         live.update(_renderable(cleaned or " "))
         live.__exit__(None, None, None)
         state["live"] = None
+        if cleaned:
+            state["cleaned_segments"].append(cleaned)
         if todos:
             render_todos(console, todos)
             state["latest_todos"] = todos
@@ -347,14 +478,29 @@ async def _stream_turn(
             kind = event.get("event")
 
             if kind == "on_chat_model_stream":
-                text = _extract_text(event["data"].get("chunk"))
+                chunk = event["data"].get("chunk")
+
+                # Reasoning channel — render as dim italic above the answer.
+                rtext = _extract_reasoning(chunk)
+                if rtext:
+                    if state["reasoning_live"] is None:
+                        _begin_reasoning_section()
+                    state["reasoning_buffer"].append(rtext)
+                    state["reasoning_live"].update(
+                        _reasoning_renderable("".join(state["reasoning_buffer"]))
+                    )
+                    continue
+
+                text = _extract_text(chunk)
                 if not text:
                     continue
                 if state["live"] is None:
                     _begin_section()
                 state["buffer"].append(text)
-                chunks.append(text)
-                state["live"].update(_renderable("".join(state["buffer"])))
+                # Hide any in-progress / complete todos JSON from the live view.
+                state["live"].update(
+                    _renderable(_display_text("".join(state["buffer"])))
+                )
 
             elif kind == "on_tool_start":
                 _end_section()
@@ -387,9 +533,85 @@ async def _stream_turn(
                     render_tool_result(console, name, output)
                 # The next on_chat_model_stream will open a fresh section.
     finally:
+        _end_reasoning_section()
         _end_section()
 
-    return "".join(chunks).strip(), state["latest_todos"]
+    # Persist the cleaned text (no JSON dumps), so auto-continue turns don't
+    # see the model's previous inline JSON and just regurgitate it.
+    return "".join(state["cleaned_segments"]).strip(), state["latest_todos"]
+
+
+def _extract_reasoning(chunk: Any) -> str:
+    """Pull the reasoning_content from a chunk's additional_kwargs, if present.
+
+    `langchain-ollama` with `reasoning=True` routes thinking-channel tokens
+    here. Returns an empty string for chunks without reasoning so the caller
+    can fall back to plain content extraction.
+    """
+    if chunk is None:
+        return ""
+    extra = getattr(chunk, "additional_kwargs", None)
+    if not isinstance(extra, dict):
+        return ""
+    rc = extra.get("reasoning_content")
+    return rc if isinstance(rc, str) else ""
+
+
+def _display_text(text: str) -> str:
+    """Hide a (complete or partial) todos JSON block from the live view.
+
+    During streaming, the Live region updates token-by-token. If the model
+    is dumping a `{"todos": [...]}` JSON object instead of tool-calling, we
+    don't want the user to watch the JSON crawl in only to have it stripped
+    at the end. Detect both:
+      - completed JSON (delegated to `_extract_inline_todos`)
+      - in-progress JSON (a fenced ```json block, or a `{` at line start
+        followed by `"...`) — strip from there onward.
+    """
+    if not text:
+        return text
+    todos, cleaned = _extract_inline_todos(text)
+    if todos is not None:
+        return cleaned
+    idx = _find_streaming_json_start(text)
+    if idx >= 0:
+        return text[:idx].rstrip()
+    return text
+
+
+def _find_streaming_json_start(text: str) -> int:
+    """Return the index where a partial JSON object likely begins, or -1.
+
+    Heuristics tuned to be conservative — only trim if the buffer really
+    looks like the start of a JSON dump, so legitimate code blocks and
+    prose `{` characters aren't hidden.
+    """
+    import re as _re
+
+    # Fenced block tagged `json` (e.g. ```json) — hide immediately.
+    m = _re.search(r"(?:^|\n)[ \t]*(?:```|~~~)json\b", text)
+    if m:
+        return m.start() + (1 if text[m.start()] == "\n" else 0)
+
+    # Untagged fence followed (eventually) by a `{` — likely a JSON dump.
+    m = _re.search(
+        r"(?:^|\n)[ \t]*(?:```|~~~)[\w-]*[ \t]*\n[ \t\n]*\{",
+        text,
+    )
+    if m:
+        return m.start() + (1 if text[m.start()] == "\n" else 0)
+
+    # Bare `{` at the start of a line followed by a JSON key (`"...`) or
+    # whitespace only (incomplete). Only consider line-leading `{` to avoid
+    # hiding inline `{x}` in prose.
+    for m in _re.finditer(r"(?:^|\n)[ \t]*\{", text):
+        i = m.end() - 1  # index of the `{`
+        tail = text[i + 1:].lstrip()
+        if tail.startswith('"') or tail == "":
+            line_start = text.rfind("\n", 0, i) + 1
+            return line_start
+
+    return -1
 
 
 def _extract_inline_todos(

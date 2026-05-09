@@ -5,12 +5,9 @@ directory containing a `SKILL.md` (YAML frontmatter + markdown body). The
 agent sees only descriptions until it decides a skill applies, then it
 reads the body.
 
-Discovery mirrors the tools layout:
-    1. ./free_agent_skills/<skill-name>/SKILL.md         (project, cwd)
-    2. ~/.config/free-agent/skills/<skill-name>/SKILL.md (global)
-
-Project takes precedence on name collision (deepagents handles this — sources
-later in the list override earlier ones).
+Discovery sources (later overrides earlier on name collision):
+    1. global    — ~/.config/free-agent/skills/<name>/SKILL.md
+    2. workspace — <active workspace>/skills/<name>/SKILL.md
 """
 from __future__ import annotations
 
@@ -21,9 +18,10 @@ from pathlib import Path
 
 import yaml
 
+from free_agent.workspace import active as _active_workspace
+
 log = logging.getLogger(__name__)
 
-PROJECT_SKILLS_DIRNAME = "free_agent_skills"
 GLOBAL_SKILLS_PATH = Path.home() / ".config" / "free-agent" / "skills"
 
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
@@ -34,11 +32,19 @@ class SkillInfo:
     name: str
     description: str
     path: Path           # absolute path to the SKILL.md file
-    scope: str           # "project" or "global"
+    scope: str           # "workspace" or "global"
 
 
 def project_skills_dir() -> Path:
-    return Path.cwd() / PROJECT_SKILLS_DIRNAME
+    """Active workspace's skills directory.
+
+    Renamed conceptually from "project" to "workspace" — the function name
+    is kept for back-compat with /skill open & friends.
+    """
+    ws = _active_workspace()
+    if ws is None:
+        return GLOBAL_SKILLS_PATH.parent / "workspaces" / "_unbound" / "skills"
+    return ws.skills_dir
 
 
 def global_skills_dir() -> Path:
@@ -49,7 +55,7 @@ def discover_skill_sources() -> list[str]:
     """Return absolute, trailing-slash paths to skill source dirs that exist.
 
     Order matters for deepagents: later sources override earlier ones on
-    name collision, so we list global first, project second.
+    name collision, so we list global first, workspace second.
     """
     sources: list[str] = []
     for d in (global_skills_dir(), project_skills_dir()):
@@ -63,7 +69,7 @@ def list_skills() -> list[SkillInfo]:
     out: list[SkillInfo] = []
     for scope, source_dir in (
         ("global", global_skills_dir()),
-        ("project", project_skills_dir()),
+        ("workspace", project_skills_dir()),
     ):
         if not source_dir.is_dir():
             continue
@@ -108,9 +114,14 @@ def is_user_skill(skill_dir: Path) -> bool:
         skill_dir = skill_dir.resolve()
     except OSError:
         return False
-    for root in (project_skills_dir().resolve(), global_skills_dir().resolve() if global_skills_dir().exists() else None):
-        if root is None:
-            continue
+    candidates: list[Path] = []
+    proj = project_skills_dir()
+    if proj.exists():
+        candidates.append(proj.resolve())
+    glob = global_skills_dir()
+    if glob.exists():
+        candidates.append(glob.resolve())
+    for root in candidates:
         try:
             skill_dir.relative_to(root)
             return True

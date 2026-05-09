@@ -37,6 +37,7 @@ from free_agent.agent.skills_registry import (
     list_skills,
     project_skills_dir,
 )
+from free_agent.cli.settings_panel import open_settings
 from free_agent.cli.wizard import (
     create_skill_wizard,
     create_subagent_wizard,
@@ -50,6 +51,12 @@ from free_agent.tools import (
     origin_of,
     reload_tools,
     user_tools_dir,
+)
+from free_agent.workspace import (
+    create_workspace,
+    delete_workspace,
+    get_workspace,
+    list_workspaces,
 )
 
 
@@ -89,15 +96,38 @@ Task:
 
 # Sent automatically by the planning loop when the previous turn left todos
 # in pending / in_progress state. Keeps the agent moving forward without the
-# user having to nudge it.
-CONTINUE_DIRECTIVE = """\
+# user having to nudge it. Formatted with the current plan snapshot so the
+# model has explicit context (the JSON it wrote was stripped from history
+# to avoid same-plan regurgitation).
+CONTINUE_DIRECTIVE_TEMPLATE = """\
 [plan execution — continue]
 
-You wrote a plan but haven't finished executing it. Continue now: take action \
-on the next pending or in-progress todo, then call `write_todos` again to \
-update its status. Don't write a summary — actually do the next step. End \
-only when every todo is "completed" AND the original task is answered.
+Current plan state:
+{plan_snapshot}
+
+Pick the FIRST pending or in_progress todo above and actually answer it now, \
+in prose. Most of these are knowledge tasks — just write the answer directly. \
+Do NOT write fake shell commands like `ls /foo` or `cat /bar`; those are not \
+tool calls, they're dead text. Only call a tool if the registered tool list \
+actually contains one that fits.
+
+After answering, re-emit the plan (call `write_todos`, or write the same \
+JSON object) with that todo's status moved to "completed". Then move to the \
+next one. End ONLY when every todo is "completed" and the original task has \
+a real prose answer.
 """
+
+
+def format_continue_directive(todos: list[dict]) -> str:
+    """Render CONTINUE_DIRECTIVE_TEMPLATE with the current plan snapshot."""
+    if not todos:
+        snapshot = "(no plan recorded)"
+    else:
+        snapshot = "\n".join(
+            f"- [{t.get('status', 'pending')}] {t.get('content', '')}"
+            for t in todos
+        )
+    return CONTINUE_DIRECTIVE_TEMPLATE.format(plan_snapshot=snapshot)
 
 
 HELP_TEXT = """\
@@ -125,7 +155,16 @@ HELP_TEXT = """\
 | `/model browse [q]` | curated catalog of pullable models (with [q] substring filter) |
 | `/model pull <name>` | download a model with live progress |
 | `/model rm <name>` | remove a local Ollama model |
-| `/model use <name>` | switch the active model in-session (rebuilds the agent) |
+| `/model use [name]` | switch the active model — no name opens an interactive picker (Ollama pulled + Anthropic catalog) |
+| `/writable [on\\|off\\|<path>]` | toggle real-disk mode (off → virtual fs); no arg shows state |
+| `/settings` | open the full-screen settings panel (provider · model · writable · …) |
+| `/ws list`        | list workspaces — active marker, paths |
+| `/ws current`     | show the active workspace details |
+| `/ws new <name>`  | create an empty workspace |
+| `/ws clone <src> <dst>` | duplicate a workspace's profile + tools + skills |
+| `/ws use <name>`  | switch active workspace (reloads profile, tools, skills) |
+| `/ws rm <name>`   | delete a workspace (refuses active or last) |
+| `/ws open`        | open the active workspace folder in your file manager |
 | `/clear`   | wipe the current session buffer |
 | `/history` | dump the session as markdown |
 | `/save`    | export session to `session-YYYYMMDD-HHMMSS.md` |
@@ -190,6 +229,16 @@ async def handle_slash_command(
     if cmd == "/model":
         return await _handle_model(rest, ctx, console)
 
+    if cmd == "/writable":
+        return _handle_writable(rest, ctx, console)
+
+    if cmd == "/settings":
+        await open_settings(ctx, console)
+        return SlashResult.HANDLED
+
+    if cmd in ("/ws", "/workspace"):
+        return await _handle_workspace(rest, ctx, console)
+
     if cmd == "/clear":
         conversation.clear()
         render_info(console, "buffer wiped — context purged.")
@@ -223,6 +272,289 @@ async def handle_slash_command(
         return SlashResult.HANDLED
 
     render_error(console, f"unknown command: {cmd} — try /help.")
+    return SlashResult.HANDLED
+
+
+# ─── /ws (workspace) dispatcher ─────────────────────────────────────────────
+
+
+async def _handle_workspace(
+    rest: str, ctx: SessionContext, console: Console
+) -> SlashResult:
+    parts = rest.split(maxsplit=2)
+    sub = parts[0].lower() if parts else ""
+
+    if sub in ("", "list", "ls"):
+        return _ws_list(ctx, console)
+    if sub in ("current", "show", "info"):
+        return _ws_current(ctx, console)
+    if sub in ("use", "switch", "activate"):
+        return await _ws_use(parts[1] if len(parts) > 1 else "", ctx, console)
+    if sub in ("new", "create", "add"):
+        return await _ws_new(parts[1] if len(parts) > 1 else "", ctx, console)
+    if sub == "clone":
+        src = parts[1] if len(parts) > 1 else ""
+        dst = parts[2] if len(parts) > 2 else ""
+        return await _ws_clone(src, dst, ctx, console)
+    if sub in ("rm", "remove", "del", "delete"):
+        return await _ws_remove(parts[1] if len(parts) > 1 else "", ctx, console)
+    if sub in ("open", "edit", "explore"):
+        _open_in_file_manager(ctx.workspace.root, console)
+        return SlashResult.HANDLED
+    if sub in ("dir", "where", "path"):
+        render_info(
+            console,
+            f"workspace [bold bright_magenta]{ctx.workspace.name}[/] → "
+            f"[bold bright_cyan]{ctx.workspace.root}[/]",
+        )
+        return SlashResult.HANDLED
+
+    render_error(
+        console,
+        f"unknown /ws action: {sub!r}. try: list · current · use · new · clone · rm · open · dir",
+    )
+    return SlashResult.HANDLED
+
+
+def _ws_list(ctx: SessionContext, console: Console) -> SlashResult:
+    workspaces = list_workspaces()
+    if not workspaces:
+        render_info(console, "no workspaces yet. create one with [bold]/ws new <name>[/].")
+        return SlashResult.HANDLED
+
+    lines = ["| active | name | path | tools | skills |", "|---|---|---|---|---|"]
+    for ws in workspaces:
+        marker = "●" if ws.name == ctx.workspace.name else " "
+        n_tools = (
+            sum(1 for _ in ws.tools_dir.glob("*.py"))
+            if ws.tools_dir.is_dir()
+            else 0
+        )
+        n_skills = (
+            sum(1 for c in ws.skills_dir.iterdir() if c.is_dir())
+            if ws.skills_dir.is_dir()
+            else 0
+        )
+        lines.append(
+            f"| {marker} | **{ws.name}** | `{ws.root}` | {n_tools} | {n_skills} |"
+        )
+    render_markdown_block(console, "\n".join(lines), title="▓▒░ WORKSPACES ░▒▓")
+    return SlashResult.HANDLED
+
+
+def _ws_current(ctx: SessionContext, console: Console) -> SlashResult:
+    ws = ctx.workspace
+    n_tools = (
+        sum(1 for _ in ws.tools_dir.glob("*.py")) if ws.tools_dir.is_dir() else 0
+    )
+    n_skills = (
+        sum(1 for c in ws.skills_dir.iterdir() if c.is_dir())
+        if ws.skills_dir.is_dir()
+        else 0
+    )
+    has_yaml = "yes" if ws.config_file.is_file() else "no (using defaults)"
+    body = (
+        f"- **name**:    `{ws.name}`\n"
+        f"- **root**:    `{ws.root}`\n"
+        f"- **profile**: {has_yaml}\n"
+        f"- **tools**:   {n_tools} python file(s) under `{ws.tools_dir}`\n"
+        f"- **skills**:  {n_skills} skill folder(s) under `{ws.skills_dir}`\n"
+    )
+    render_markdown_block(console, body, title="▓▒░ ACTIVE WORKSPACE ░▒▓")
+    return SlashResult.HANDLED
+
+
+async def _ws_use(name: str, ctx: SessionContext, console: Console) -> SlashResult:
+    if not name:
+        render_error(console, "usage: /ws use <name>")
+        return SlashResult.HANDLED
+    target = get_workspace(name)
+    if target is None:
+        render_error(
+            console,
+            f"no workspace named {name!r}. existing: "
+            f"{[w.name for w in list_workspaces()]}",
+        )
+        return SlashResult.HANDLED
+    if target.name == ctx.workspace.name:
+        render_info(console, f"already on [bold bright_magenta]{name}[/].")
+        return SlashResult.HANDLED
+
+    try:
+        ctx.switch_workspace(target)
+    except Exception as exc:
+        render_error(console, f"switch failed: {exc}")
+        return SlashResult.HANDLED
+
+    render_info(
+        console,
+        f"workspace → [bold bright_magenta]{target.name}[/]  "
+        f"[grey50]({target.root})[/]",
+    )
+    return SlashResult.HANDLED
+
+
+async def _ws_new(name: str, ctx: SessionContext, console: Console) -> SlashResult:
+    if not name:
+        render_error(console, "usage: /ws new <name>")
+        return SlashResult.HANDLED
+    try:
+        ws = create_workspace(name)
+    except ValueError as exc:
+        render_error(console, str(exc))
+        return SlashResult.HANDLED
+
+    render_info(
+        console,
+        f"workspace [bold bright_magenta]{ws.name}[/] created at "
+        f"[bold bright_cyan]{ws.root}[/].",
+    )
+    try:
+        ans = await ctx.prompt_session.prompt_async(
+            f"  switch to [bold bright_magenta]{ws.name}[/] now? [Y/n] "
+        )
+    except (KeyboardInterrupt, EOFError):
+        ans = "n"
+    if ans.strip().lower() in ("", "y", "yes"):
+        try:
+            ctx.switch_workspace(ws)
+            render_info(console, f"now on [bold bright_magenta]{ws.name}[/].")
+        except Exception as exc:
+            render_error(console, f"switch failed: {exc}")
+    return SlashResult.HANDLED
+
+
+async def _ws_clone(
+    src_name: str, dst_name: str, ctx: SessionContext, console: Console
+) -> SlashResult:
+    if not src_name or not dst_name:
+        render_error(console, "usage: /ws clone <src> <dst>")
+        return SlashResult.HANDLED
+    src = get_workspace(src_name)
+    if src is None:
+        render_error(console, f"no workspace named {src_name!r}.")
+        return SlashResult.HANDLED
+    try:
+        ws = create_workspace(dst_name, seed_from=src)
+    except ValueError as exc:
+        render_error(console, str(exc))
+        return SlashResult.HANDLED
+    render_info(
+        console,
+        f"cloned [bold bright_magenta]{src.name}[/] → "
+        f"[bold bright_magenta]{ws.name}[/]  [grey50]({ws.root})[/]",
+    )
+    return SlashResult.HANDLED
+
+
+async def _ws_remove(
+    name: str, ctx: SessionContext, console: Console
+) -> SlashResult:
+    if not name:
+        render_error(console, "usage: /ws rm <name>")
+        return SlashResult.HANDLED
+    target = get_workspace(name)
+    if target is None:
+        render_error(console, f"no workspace named {name!r}.")
+        return SlashResult.HANDLED
+    try:
+        ans = await ctx.prompt_session.prompt_async(
+            f"  delete workspace [bold bright_magenta]{name}[/] and ALL its "
+            f"contents? this cannot be undone. [y/N] "
+        )
+    except (KeyboardInterrupt, EOFError):
+        ans = "n"
+    if ans.strip().lower() not in ("y", "yes"):
+        render_info(console, "kept.")
+        return SlashResult.HANDLED
+    try:
+        delete_workspace(name)
+    except ValueError as exc:
+        render_error(console, str(exc))
+        return SlashResult.HANDLED
+    render_info(console, f"workspace [bold bright_magenta]{name}[/] removed.")
+    return SlashResult.HANDLED
+
+
+# ─── /writable dispatcher ───────────────────────────────────────────────────
+
+
+def _handle_writable(arg: str, ctx: SessionContext, console: Console) -> SlashResult:
+    """Toggle real-filesystem mode at runtime.
+
+    Usage:
+      /writable             show current state
+      /writable on          enable, scoped to the current working directory
+      /writable off         disable (back to the in-memory virtual filesystem)
+      /writable <path>      enable, scoped to the given path
+    """
+    arg = arg.strip()
+
+    if not arg:
+        if ctx.writable_root is None:
+            render_info(
+                console,
+                "writable mode is [bold]OFF[/] — agent uses the in-memory virtual "
+                f"filesystem. enable with [bold bright_cyan]/writable on[/] (scope = "
+                f"[bold bright_cyan]{Path.cwd()}[/]) or [bold bright_cyan]/writable <path>[/].",
+            )
+        else:
+            render_info(
+                console,
+                "writable mode is [bold red]ON[/] — agent reads/writes under "
+                f"[bold bright_cyan]{ctx.writable_root}[/]. disable with "
+                "[bold bright_cyan]/writable off[/].",
+            )
+        return SlashResult.HANDLED
+
+    low = arg.lower()
+    if low == "off":
+        if ctx.writable_root is None:
+            render_info(console, "already off.")
+            return SlashResult.HANDLED
+        old_root = ctx.writable_root
+        old_flag = ctx.settings.writable
+        ctx.writable_root = None
+        ctx.settings.writable = False
+        try:
+            ctx.rebuild_agent()
+        except Exception as exc:
+            ctx.writable_root = old_root
+            ctx.settings.writable = old_flag
+            render_error(console, f"rebuild failed; writable mode unchanged: {exc}")
+            return SlashResult.HANDLED
+        render_info(
+            console,
+            "writable mode [bold]OFF[/] — virtual filesystem active. "
+            "(the [bold yellow1]shell[/] tool still works on the real machine.)",
+        )
+        return SlashResult.HANDLED
+
+    if low == "on":
+        new_root = Path.cwd().resolve()
+    else:
+        new_root = Path(arg).expanduser().resolve()
+
+    if not new_root.is_dir():
+        render_error(console, f"not a directory: {new_root}")
+        return SlashResult.HANDLED
+
+    old_root = ctx.writable_root
+    old_flag = ctx.settings.writable
+    ctx.writable_root = new_root
+    ctx.settings.writable = True
+    try:
+        ctx.rebuild_agent()
+    except Exception as exc:
+        ctx.writable_root = old_root
+        ctx.settings.writable = old_flag
+        render_error(console, f"rebuild failed; writable mode unchanged: {exc}")
+        return SlashResult.HANDLED
+    render_info(
+        console,
+        f"writable mode [bold red]ON[/] — agent can read/write under "
+        f"[bold bright_cyan]{new_root}[/]. paths cannot escape via .. / ~ / absolute outside-root.",
+    )
     return SlashResult.HANDLED
 
 
@@ -359,10 +691,31 @@ async def _tool_new(ctx: SessionContext, console: Console) -> SlashResult:
         render_error(console, f"rebuild failed: {exc}")
         return SlashResult.HANDLED
 
+    # Show what the main agent actually has bound, so the user can verify
+    # the new tool reached it (vs. just sitting in the registry).
+    if ctx.profile.tools is None:
+        agent_tools = [t.name for t in TOOLS]
+        scope_note = "all registered tools"
+    else:
+        agent_tools = list(ctx.profile.tools)
+        scope_note = "main agent's explicit list"
+    in_agent = name in agent_tools
+    marker = "[bold bright_green]✓[/]" if in_agent else "[bold red1]✗[/]"
     render_info(
         console,
-        f"tool online — [bold yellow1]{name}[/] available to the agent now.",
+        f"tool online — [bold yellow1]{name}[/] {marker} reachable by the agent.\n"
+        f"[grey50]agent has {len(agent_tools)} tool(s) ({scope_note}): "
+        f"{', '.join(agent_tools[:8])}"
+        + (f" … (+{len(agent_tools) - 8} more)" if len(agent_tools) > 8 else "")
+        + "[/]",
     )
+    if not in_agent:
+        render_info(
+            console,
+            "[bold]heads-up:[/] the tool is registered but [bold red1]not in "
+            "the agent's tools list[/]. run [bold]/agent[/] to inspect, or edit "
+            "your workspace's [bold]free-agent.yaml[/] to add it.",
+        )
     return SlashResult.HANDLED
 
 
@@ -418,8 +771,8 @@ async def _tool_remove(name: str, ctx: SessionContext, console: Console) -> Slas
 
 def _tool_open(scope: str, console: Console) -> SlashResult:
     """Open the user-tools folder in the OS file manager."""
-    s = scope.lower().strip() if scope else "project"
-    if s in ("p", "project", "local"):
+    s = scope.lower().strip() if scope else "workspace"
+    if s in ("p", "project", "local", "ws", "workspace"):
         targets = [user_tools_dir()]
     elif s in ("g", "global"):
         targets = [global_tools_dir()]
@@ -428,7 +781,7 @@ def _tool_open(scope: str, console: Console) -> SlashResult:
     else:
         render_error(
             console,
-            f"unknown scope: {scope!r}. use project · global · both.",
+            f"unknown scope: {scope!r}. use workspace · global · both.",
         )
         return SlashResult.HANDLED
 
@@ -443,8 +796,8 @@ def _tool_dir(console: Console) -> SlashResult:
     global_ = global_tools_dir()
     proj_state = "exists" if project.is_dir() else "not yet created"
     glob_state = "exists" if global_.is_dir() else "not yet created"
-    render_info(console, f"project tools: [bold bright_cyan]{project}[/]  [grey50]({proj_state})[/]")
-    render_info(console, f"global  tools: [bold bright_cyan]{global_}[/]  [grey50]({glob_state})[/]")
+    render_info(console, f"workspace tools: [bold bright_cyan]{project}[/]  [grey50]({proj_state})[/]")
+    render_info(console, f"global    tools: [bold bright_cyan]{global_}[/]  [grey50]({glob_state})[/]")
     return SlashResult.HANDLED
 
 
@@ -645,15 +998,15 @@ def _skill_reload(ctx: SessionContext, console: Console) -> SlashResult:
 
 
 def _skill_open(scope: str, console: Console) -> SlashResult:
-    s = scope.lower().strip() if scope else "project"
-    if s in ("p", "project", "local"):
+    s = scope.lower().strip() if scope else "workspace"
+    if s in ("p", "project", "local", "ws", "workspace"):
         targets = [project_skills_dir()]
     elif s in ("g", "global"):
         targets = [global_skills_dir()]
     elif s in ("both", "all", "*"):
         targets = [project_skills_dir(), global_skills_dir()]
     else:
-        render_error(console, f"unknown scope: {scope!r}. use project · global · both.")
+        render_error(console, f"unknown scope: {scope!r}. use workspace · global · both.")
         return SlashResult.HANDLED
     for target in targets:
         _open_in_file_manager(target, console)
@@ -665,8 +1018,8 @@ def _skill_dir(console: Console) -> SlashResult:
     global_ = global_skills_dir()
     proj_state = "exists" if project.is_dir() else "not yet created"
     glob_state = "exists" if global_.is_dir() else "not yet created"
-    render_info(console, f"project skills: [bold bright_cyan]{project}[/]  [grey50]({proj_state})[/]")
-    render_info(console, f"global  skills: [bold bright_cyan]{global_}[/]  [grey50]({glob_state})[/]")
+    render_info(console, f"workspace skills: [bold bright_cyan]{project}[/]  [grey50]({proj_state})[/]")
+    render_info(console, f"global    skills: [bold bright_cyan]{global_}[/]  [grey50]({glob_state})[/]")
     return SlashResult.HANDLED
 
 
@@ -948,17 +1301,163 @@ async def _model_remove(name: str, ctx: SessionContext, console: Console) -> Sla
     return SlashResult.HANDLED
 
 
-async def _model_use(name: str, ctx: SessionContext, console: Console) -> SlashResult:
-    if not name:
-        render_error(console, "usage: /model use <name>")
+def _infer_provider(name: str) -> str:
+    """Guess provider from a model name. Anthropic models all start with
+    `claude-`; everything else is treated as Ollama (where any string can
+    be a valid tag, e.g. `qwen3.5:9b`, `mistral:latest`, `llama3:8b`)."""
+    return "anthropic" if name.lower().startswith("claude-") else "ollama"
+
+
+def _collect_pickable_models(ctx: SessionContext) -> list[dict]:
+    """Build the rows for the interactive picker.
+
+    Order: locally-pulled Ollama models first (alphabetical), then the
+    curated Anthropic catalog. Each row is enabled iff it can actually
+    be used right now — Anthropic rows get disabled when no API key is
+    configured, with a clear note.
+    """
+    from free_agent.cli.settings_panel import ANTHROPIC_MODELS
+
+    rows: list[dict] = []
+
+    # Ollama — only models actually pulled (no point offering ones that
+    # would trigger a fresh download from a "use" picker; for that the
+    # user has /model pull or /model browse).
+    try:
+        ollama_models = _ollama_list(ctx.settings.ollama_base_url)
+    except RuntimeError:
+        ollama_models = []
+
+    for m in sorted(ollama_models, key=lambda x: x["name"]):
+        size = m.get("size_bytes") or 0
+        units = ["B", "KB", "MB", "GB", "TB"]
+        val = float(size)
+        i = 0
+        while val >= 1024 and i < len(units) - 1:
+            val /= 1024
+            i += 1
+        size_label = f"{val:.1f} {units[i]}" if size else "—"
+        rows.append({
+            "name": m["name"],
+            "provider": "ollama",
+            "note": size_label,
+            "enabled": True,
+        })
+
+    # Anthropic — always show the curated catalog; mark disabled when
+    # no key is present so the user understands why a pick would fail.
+    key = ctx.settings.anthropic_api_key
+    has_key = key is not None and key.get_secret_value().strip() != ""
+    for name, blurb in ANTHROPIC_MODELS:
+        rows.append({
+            "name": name,
+            "provider": "anthropic",
+            "note": blurb if has_key else f"{blurb}  ·  needs api key (/settings)",
+            "enabled": has_key,
+        })
+
+    # Number them 1-based.
+    for idx, row in enumerate(rows, start=1):
+        row["index"] = idx
+    return rows
+
+
+async def _model_use_interactive(
+    ctx: SessionContext, console: Console
+) -> SlashResult:
+    """Show the picker and dispatch to the same switch path as `_model_use`."""
+    from free_agent.cli.console import render_model_picker
+
+    rows = _collect_pickable_models(ctx)
+    if not rows:
+        render_error(
+            console,
+            "no models available — pull one with /model pull <name> or "
+            "configure an Anthropic key via /settings.",
+        )
         return SlashResult.HANDLED
 
-    if name == ctx.settings.active_model:
+    render_model_picker(
+        console,
+        rows,
+        active_name=ctx.settings.active_model,
+        active_provider=ctx.settings.provider,
+    )
+
+    try:
+        ans = await ctx.prompt_session.prompt_async(
+            "  pick number ▶ "
+        )
+    except (KeyboardInterrupt, EOFError):
+        render_info(console, "cancelled.")
+        return SlashResult.HANDLED
+
+    ans = ans.strip()
+    if not ans:
+        render_info(console, "cancelled.")
+        return SlashResult.HANDLED
+
+    try:
+        idx = int(ans)
+    except ValueError:
+        # Friendly fallback: let the user type the model name too.
+        return await _model_use(ans, ctx, console)
+
+    if not 1 <= idx <= len(rows):
+        render_error(console, f"invalid pick {idx} — choose 1..{len(rows)}.")
+        return SlashResult.HANDLED
+
+    pick = rows[idx - 1]
+    if not pick["enabled"]:
+        render_error(
+            console,
+            f"{pick['name']!r} is not selectable: {pick['note']}",
+        )
+        return SlashResult.HANDLED
+
+    return await _model_use(pick["name"], ctx, console)
+
+
+async def _model_use(name: str, ctx: SessionContext, console: Console) -> SlashResult:
+    if not name:
+        return await _model_use_interactive(ctx, console)
+
+    target_provider = _infer_provider(name)
+
+    if (
+        name == ctx.settings.active_model
+        and target_provider == ctx.settings.provider
+    ):
         render_info(console, f"already using {name}.")
         return SlashResult.HANDLED
 
-    # If Ollama and model not pulled, offer to pull it.
-    if ctx.settings.provider == "ollama":
+    # Cross-provider switch: validate prerequisites BEFORE we touch state.
+    if target_provider != ctx.settings.provider:
+        if target_provider == "anthropic":
+            key = ctx.settings.anthropic_api_key
+            if key is None or not key.get_secret_value().strip():
+                render_error(
+                    console,
+                    f"{name!r} is an Anthropic model but no API key is set. "
+                    "configure it via [bold bright_cyan]/settings[/] (it gets "
+                    "saved to ~/.config/free-agent/secrets.json), or "
+                    "`export ANTHROPIC_API_KEY=…`.",
+                )
+                return SlashResult.HANDLED
+            render_info(
+                console,
+                f"switching provider [grey50]{ctx.settings.provider}[/] → "
+                f"[bold]anthropic[/] for this model.",
+            )
+
+    # Ollama-target: if not pulled, offer to pull it. Skip when we're
+    # crossing INTO Ollama from Anthropic — let the preflight inside
+    # switch_model surface the missing-tag error itself, since prompting
+    # to pull mid-switch is more complexity than it's worth.
+    if (
+        target_provider == "ollama"
+        and ctx.settings.provider == "ollama"
+    ):
         try:
             available = {m["name"] for m in _ollama_list(ctx.settings.ollama_base_url)}
         except RuntimeError as exc:
@@ -980,7 +1479,9 @@ async def _model_use(name: str, ctx: SessionContext, console: Console) -> SlashR
                 return result
 
     try:
-        await asyncio.to_thread(ctx.switch_model, name)
+        await asyncio.to_thread(
+            ctx.switch_model, name, provider=target_provider
+        )
     except Exception as exc:
         render_error(console, f"switch failed: {exc}")
         return SlashResult.HANDLED
