@@ -29,6 +29,8 @@ from free_agent.cli.console import (
     render_markdown_block,
     render_model_library,
     render_model_list,
+    render_mode_tools,
+    render_modes,
     render_tools_inventory,
 )
 from free_agent.cli.context import SessionContext
@@ -52,6 +54,7 @@ from free_agent.tools import (
     reload_tools,
     user_tools_dir,
 )
+from free_agent.modes import MODES, get_mode
 from free_agent.workspace import (
     create_workspace,
     delete_workspace,
@@ -137,6 +140,9 @@ HELP_TEXT = """\
 | `/plan <task>` | force the agent to write_todos before acting on the task |
 | `/tools`   | list every tool the agent can call |
 | `/agent`   | show the loaded agent profile (main + subagents) |
+| `/mode list`       | list preset modes: code · science · security · finance |
+| `/mode use <name>` | activate a mode (specialized prompt + tools) |
+| `/mode off`        | back to the plain agent (workspace profile only) |
 | `/sub new`         | wizard — create a subagent (LLM drafts the system prompt) |
 | `/sub rm <name>`   | remove a subagent by name |
 | `/sub list`        | alias for `/agent` |
@@ -155,7 +161,7 @@ HELP_TEXT = """\
 | `/model browse [q]` | curated catalog of pullable models (with [q] substring filter) |
 | `/model pull <name>` | download a model with live progress |
 | `/model rm <name>` | remove a local Ollama model |
-| `/model use [name]` | switch the active model — no name opens an interactive picker (Ollama pulled + Anthropic catalog) |
+| `/model use [name]` | switch the active model — no name opens an interactive picker (Fireworks + Ollama + Anthropic). Prefix `fireworks:` / `ollama:` to force a provider |
 | `/writable [on\\|off\\|<path>]` | toggle real-disk mode (off → virtual fs); no arg shows state |
 | `/settings` | open the full-screen settings panel (provider · model · writable · …) |
 | `/ws list`        | list workspaces — active marker, paths |
@@ -211,7 +217,13 @@ async def handle_slash_command(
 
     if cmd == "/tools":
         render_tools_inventory(console, TOOLS, DEEPAGENTS_BUILTINS)
+        mode = get_mode(ctx.settings.mode)
+        if mode is not None:
+            render_mode_tools(console, mode)
         return SlashResult.HANDLED
+
+    if cmd == "/mode":
+        return await _handle_mode(rest, ctx, console)
 
     if cmd == "/agent":
         _render_profile(ctx, console)
@@ -1067,7 +1079,32 @@ def _require_ollama(ctx: SessionContext, console: Console, action: str) -> bool:
     return True
 
 
+def _fireworks_model_list(ctx: SessionContext, console: Console) -> SlashResult:
+    from free_agent.agent.fireworks_catalog import list_models
+
+    key = ctx.settings.fireworks_api_key
+    if key is None or not key.get_secret_value().strip():
+        render_error(console, "no FIREWORKS_API_KEY configured — set it via /settings.")
+        return SlashResult.HANDLED
+    try:
+        models = list_models(key.get_secret_value(), ctx.settings.fireworks_base_url)
+    except RuntimeError as exc:
+        render_error(console, str(exc))
+        return SlashResult.HANDLED
+    lines = ["[bold bright_cyan]fireworks serverless models[/] (▶ active · ⚙ tool calling)"]
+    for m in models:
+        marker = "▶" if m["name"] == ctx.settings.fireworks_model else " "
+        tools = "⚙" if m["supports_tools"] else " "
+        ctxlen = f"{m['context_length'] // 1024}k ctx" if m["context_length"] else ""
+        lines.append(f"  {marker} {tools} [bold yellow1]{m['name']}[/]  [grey50]{ctxlen}[/]")
+    lines.append("[grey50]switch with /model use <name> (short ids like `glm-5p3` work)[/]")
+    render_info(console, "\n".join(lines))
+    return SlashResult.HANDLED
+
+
 def _model_list(ctx: SessionContext, console: Console) -> SlashResult:
+    if ctx.settings.provider == "fireworks":
+        return _fireworks_model_list(ctx, console)
     if not _require_ollama(ctx, console, "list"):
         return SlashResult.HANDLED
     try:
@@ -1301,11 +1338,84 @@ async def _model_remove(name: str, ctx: SessionContext, console: Console) -> Sla
     return SlashResult.HANDLED
 
 
-def _infer_provider(name: str) -> str:
-    """Guess provider from a model name. Anthropic models all start with
-    `claude-`; everything else is treated as Ollama (where any string can
-    be a valid tag, e.g. `qwen3.5:9b`, `mistral:latest`, `llama3:8b`)."""
-    return "anthropic" if name.lower().startswith("claude-") else "ollama"
+# ─── /mode ──────────────────────────────────────────────────────────────────
+
+
+async def _handle_mode(rest: str, ctx: SessionContext, console: Console) -> SlashResult:
+    parts = rest.split(maxsplit=1)
+    sub = parts[0].lower() if parts else "list"
+    arg = parts[1].strip() if len(parts) > 1 else ""
+
+    if sub in ("list", "ls"):
+        render_modes(console, list(MODES.values()), active=ctx.settings.mode)
+        return SlashResult.HANDLED
+
+    if sub in ("off", "none", "clear"):
+        sub, arg = "use", "off"
+    elif sub != "use":
+        # `/mode finance` is shorthand for `/mode use finance`.
+        sub, arg = "use", rest.strip()
+
+    if not arg:
+        render_error(console, f"usage: /mode use <{'|'.join(MODES)}|off>")
+        return SlashResult.HANDLED
+
+    try:
+        target = get_mode(arg)
+    except ValueError as exc:
+        render_error(console, str(exc))
+        return SlashResult.HANDLED
+
+    target_name = target.name if target else ""
+    if target_name == ctx.settings.mode:
+        render_info(console, f"mode already {target_name or 'off'}.")
+        return SlashResult.HANDLED
+
+    try:
+        ctx.switch_mode(target_name or None)
+    except Exception as exc:
+        render_error(console, f"mode switch failed: {exc}")
+        return SlashResult.HANDLED
+
+    if target is None:
+        render_info(console, "mode [bold]off[/] — plain agent with the workspace profile.")
+    else:
+        render_info(
+            console,
+            f"mode [bold yellow1]{target.name}[/] — {target.title}. "
+            f"tools: [bright_cyan]{', '.join(target.tool_names)}[/]",
+        )
+        if target.name == "code" and ctx.writable_root is None:
+            render_info(
+                console,
+                "[grey50]tip: run [bold]/writable on[/] so the agent can edit files "
+                "(str_replace / create_file).[/]",
+            )
+    return SlashResult.HANDLED
+
+
+def _infer_provider(name: str, current: str = "ollama") -> tuple[str, str]:
+    """Guess the provider from a model name. Returns (provider, clean_name).
+
+    - `fireworks:<id>` / `accounts/…`  → fireworks
+    - `ollama:<tag>`                   → ollama
+    - `claude-…`                       → anthropic
+    - `name:tag` (Ollama tag syntax)   → ollama
+    - anything else                    → the current provider when it's
+      fireworks (so `/model use glm-5p3` just works), otherwise ollama.
+    """
+    low = name.lower()
+    if low.startswith("fireworks:"):
+        return "fireworks", name.split(":", 1)[1].strip()
+    if low.startswith("ollama:"):
+        return "ollama", name.split(":", 1)[1].strip()
+    if low.startswith("accounts/"):
+        return "fireworks", name
+    if low.startswith("claude-"):
+        return "anthropic", name
+    if ":" in name:
+        return "ollama", name
+    return ("fireworks" if current == "fireworks" else "ollama"), name
 
 
 def _collect_pickable_models(ctx: SessionContext) -> list[dict]:
@@ -1316,9 +1426,20 @@ def _collect_pickable_models(ctx: SessionContext) -> list[dict]:
     be used right now — Anthropic rows get disabled when no API key is
     configured, with a clear note.
     """
-    from free_agent.cli.settings_panel import ANTHROPIC_MODELS
+    from free_agent.cli.settings_panel import ANTHROPIC_MODELS, FIREWORKS_MODELS
 
     rows: list[dict] = []
+
+    # Fireworks — the standard provider; curated serverless catalog.
+    fw_key = ctx.settings.fireworks_api_key
+    has_fw_key = fw_key is not None and fw_key.get_secret_value().strip() != ""
+    for name, blurb in FIREWORKS_MODELS:
+        rows.append({
+            "name": name,
+            "provider": "fireworks",
+            "note": blurb if has_fw_key else f"{blurb}  ·  needs FIREWORKS_API_KEY (/settings)",
+            "enabled": has_fw_key,
+        })
 
     # Ollama — only models actually pulled (no point offering ones that
     # would trigger a fresh download from a "use" picker; for that the
@@ -1422,7 +1543,11 @@ async def _model_use(name: str, ctx: SessionContext, console: Console) -> SlashR
     if not name:
         return await _model_use_interactive(ctx, console)
 
-    target_provider = _infer_provider(name)
+    from free_agent.config import normalize_fireworks_model
+
+    target_provider, name = _infer_provider(name, ctx.settings.provider)
+    if target_provider == "fireworks":
+        name = normalize_fireworks_model(name)
 
     if (
         name == ctx.settings.active_model
@@ -1433,6 +1558,21 @@ async def _model_use(name: str, ctx: SessionContext, console: Console) -> SlashR
 
     # Cross-provider switch: validate prerequisites BEFORE we touch state.
     if target_provider != ctx.settings.provider:
+        if target_provider == "fireworks":
+            key = ctx.settings.fireworks_api_key
+            if key is None or not key.get_secret_value().strip():
+                render_error(
+                    console,
+                    f"{name!r} is a Fireworks model but no API key is set. "
+                    "configure it via [bold bright_cyan]/settings[/] or "
+                    "`export FIREWORKS_API_KEY=…`.",
+                )
+                return SlashResult.HANDLED
+            render_info(
+                console,
+                f"switching provider [grey50]{ctx.settings.provider}[/] → "
+                f"[bold]fireworks[/] for this model.",
+            )
         if target_provider == "anthropic":
             key = ctx.settings.anthropic_api_key
             if key is None or not key.get_secret_value().strip():
@@ -1500,6 +1640,9 @@ def _render_profile(ctx: SessionContext, console: Console) -> None:
 
     profile = ctx.profile
     available_tool_names = [t.name for t in TOOLS]
+    mode = get_mode(ctx.settings.mode)
+    if mode is not None:
+        profile = mode.apply(profile, available_tool_names)
     main_tools = (
         list(profile.tools) if profile.tools is not None else available_tool_names
     )
@@ -1518,7 +1661,7 @@ def _render_profile(ctx: SessionContext, console: Console) -> None:
     render_agent_profile(
         console,
         main_model=ctx.settings.active_model,
-        main_provider=ctx.settings.provider,
+        main_provider=ctx.settings.provider + (f" · mode={mode.name}" if mode else ""),
         main_system_prompt=profile.system_prompt or SYSTEM_PROMPT,
         main_tools=main_tools,
         subagents=subagents,

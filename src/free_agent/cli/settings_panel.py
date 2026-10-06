@@ -26,6 +26,8 @@ from typing import TYPE_CHECKING
 import yaml
 from pydantic import SecretStr
 
+from free_agent.config import PROVIDERS, normalize_fireworks_model
+
 if TYPE_CHECKING:
     from rich.console import Console
 
@@ -42,12 +44,27 @@ ANTHROPIC_MODELS = (
 )
 
 
+# Curated Fireworks serverless models with tool calling. `/model list` shows
+# the live catalog for your key; any `accounts/...` id works.
+FIREWORKS_MODELS = (
+    ("accounts/fireworks/models/kimi-k3",            "Kimi K3       — default, strong agentic coding, 1M ctx"),
+    ("accounts/fireworks/models/glm-5p3",            "GLM 5.3       — strong reasoning + tool use, 1M ctx"),
+    ("accounts/fireworks/models/deepseek-v4p1-flash","DeepSeek V4.1 Flash — fast, cheap, 1M ctx"),
+    ("accounts/fireworks/models/minimax-m3",         "MiniMax M3    — long-context agent, 512k ctx"),
+    ("accounts/fireworks/models/qwen3p8-max",        "Qwen 3.8 Max  — multilingual generalist"),
+    ("accounts/fireworks/models/gpt-oss-120b",       "gpt-oss 120B  — open-weight OpenAI, 128k ctx"),
+)
+
+
 @dataclass
 class _Snapshot:
     """Working copy of every field the panel can mutate."""
 
     workspace_name: str
     provider: str
+    fireworks_model: str
+    fireworks_api_key: str | None
+    mode: str
     ollama_model: str
     anthropic_model: str
     anthropic_api_key: str | None  # plaintext; never logged, never written to YAML body
@@ -66,9 +83,13 @@ _KEY_ABSENT_HINT = "<unset — paste your sk-ant-… here to set>"
 
 def _snapshot(ctx: "SessionContext") -> _Snapshot:
     key = ctx.settings.anthropic_api_key
+    fw_key = ctx.settings.fireworks_api_key
     return _Snapshot(
         workspace_name=ctx.workspace.name,
         provider=ctx.settings.provider,
+        fireworks_model=ctx.settings.fireworks_model,
+        fireworks_api_key=fw_key.get_secret_value() if fw_key is not None else None,
+        mode=ctx.settings.mode,
         ollama_model=ctx.settings.ollama_model,
         anthropic_model=ctx.settings.anthropic_model,
         anthropic_api_key=key.get_secret_value() if key is not None else None,
@@ -200,6 +221,14 @@ def _render_yaml(snap: _Snapshot, ctx: "SessionContext") -> str:
     catalog_lines = "\n".join(
         f"#   - {name:<30}  {note}" for name, note in ANTHROPIC_MODELS
     )
+    fw_catalog = "\n".join(f"#   - {name:<46}  {note}" for name, note in FIREWORKS_MODELS)
+    fw_placeholder = _KEY_KEEP_SENTINEL if snap.fireworks_api_key else ""
+    fw_hint = _KEY_PRESENT_HINT if snap.fireworks_api_key else "<unset — paste your fw_… key here to set>"
+    fw_status = f"currently: {_mask(snap.fireworks_api_key)}"
+
+    from free_agent.modes import MODES
+
+    mode_lines = "\n".join(f"#   - {m.name:<9} {m.title} — {m.description}" for m in MODES.values())
 
     return f"""\
 # ── free-agent settings ────────────────────────────────────────────────────
@@ -218,8 +247,24 @@ def _render_yaml(snap: _Snapshot, ctx: "SessionContext") -> str:
 # must start with a letter.
 workspace: {snap.workspace_name}
 
-# Model provider. Either `ollama` (local) or `anthropic` (API key required).
+# Preset mode — specialized system prompt + tool pack. `off` = plain agent.
+{mode_lines}
+mode: {snap.mode or "off"}
+
+# Model provider: `fireworks` (standard — hosted open models, API key
+# required), `ollama` (local) or `anthropic` (API key required).
 provider: {snap.provider}
+
+# Active Fireworks model. Short ids (`glm-5p3`) are expanded to
+# `accounts/fireworks/models/<id>`. `/model list` shows the live catalog.
+{fw_catalog}
+fireworks_model: {snap.fireworks_model}
+
+# Fireworks API key — used when provider == fireworks.
+# {fw_status}
+# Same editing rules as the Anthropic key below. A real FIREWORKS_API_KEY
+# env var (or .env entry) still wins over the persisted value.
+fireworks_api_key: {fw_placeholder}  # {fw_hint}
 
 # Active Ollama model. Use `/model browse` from the chat to list pullable
 # models, or `ollama pull <name>` from your shell.
@@ -280,9 +325,23 @@ def _parse_yaml(data: dict, snap: _Snapshot) -> _Snapshot:
 
     if "provider" in data and data["provider"] is not None:
         p = str(data["provider"]).strip().lower()
-        if p not in ("ollama", "anthropic"):
-            raise ValueError(f"unknown provider: {p!r} (use ollama or anthropic)")
+        if p not in PROVIDERS:
+            raise ValueError(f"unknown provider: {p!r} (use {', '.join(PROVIDERS)})")
         pending.provider = p
+
+    if "mode" in data:
+        from free_agent.modes import get_mode
+
+        raw_mode = data["mode"]
+        # YAML 1.1 parses a bare `off` / `no` as boolean False.
+        m = get_mode(None if raw_mode in (None, False) else str(raw_mode))
+        pending.mode = m.name if m else ""
+
+    if "fireworks_model" in data and data["fireworks_model"] is not None:
+        pending.fireworks_model = normalize_fireworks_model(str(data["fireworks_model"]))
+
+    if "fireworks_api_key" in data:
+        pending.fireworks_api_key = _parse_key(data["fireworks_api_key"], pending.fireworks_api_key)
 
     if "ollama_model" in data and data["ollama_model"] is not None:
         pending.ollama_model = str(data["ollama_model"]).strip()
@@ -290,30 +349,8 @@ def _parse_yaml(data: dict, snap: _Snapshot) -> _Snapshot:
     if "anthropic_model" in data and data["anthropic_model"] is not None:
         pending.anthropic_model = str(data["anthropic_model"]).strip()
 
-    # API key parsing — three states: keep / set new / clear
     if "anthropic_api_key" in data:
-        raw = data["anthropic_api_key"]
-        if raw is None:
-            pending.anthropic_api_key = None  # explicit clear via `null`
-        else:
-            text = str(raw).strip()
-            if text == _KEY_KEEP_SENTINEL or text in (
-                _KEY_PRESENT_HINT,
-                _KEY_ABSENT_HINT,
-            ):
-                pass  # keep existing
-            elif text == "":
-                pending.anthropic_api_key = None  # clear
-            else:
-                # Strip wrapping quotes the user might paste from a secrets manager.
-                if (text.startswith('"') and text.endswith('"')) or (
-                    text.startswith("'") and text.endswith("'")
-                ):
-                    text = text[1:-1].strip()
-                if not text:
-                    pending.anthropic_api_key = None
-                else:
-                    pending.anthropic_api_key = text
+        pending.anthropic_api_key = _parse_key(data["anthropic_api_key"], pending.anthropic_api_key)
 
     if "temperature" in data and data["temperature"] is not None:
         try:
@@ -343,6 +380,12 @@ def _parse_yaml(data: dict, snap: _Snapshot) -> _Snapshot:
                 raise ValueError(f"writable_root is not an existing directory: {p}")
             pending.writable_root = p
 
+    if pending.provider == "fireworks" and not (pending.fireworks_api_key or "").strip():
+        raise ValueError(
+            "provider set to 'fireworks' but no API key is configured. "
+            "Paste a key into the `fireworks_api_key` field."
+        )
+
     # Refuse the obvious foot-gun: switching to anthropic with no key set.
     if pending.provider == "anthropic" and not (pending.anthropic_api_key or "").strip():
         raise ValueError(
@@ -353,11 +396,29 @@ def _parse_yaml(data: dict, snap: _Snapshot) -> _Snapshot:
     return pending
 
 
+def _parse_key(raw: object, current: str | None) -> str | None:
+    """API key field — three states: keep (sentinel/unchanged) / set new / clear."""
+    if raw is None:
+        return None  # explicit clear via `null`
+    text = str(raw).strip()
+    if text == _KEY_KEEP_SENTINEL or text in (_KEY_PRESENT_HINT, _KEY_ABSENT_HINT):
+        return current
+    # Strip wrapping quotes the user might paste from a secrets manager.
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        text = text[1:-1].strip()
+    return text or None
+
+
 # ─── commit ─────────────────────────────────────────────────────────────────
 
 
 def _restore(ctx: "SessionContext", snap: _Snapshot) -> None:
     ctx.settings.provider = snap.provider  # type: ignore[assignment]
+    ctx.settings.fireworks_model = snap.fireworks_model
+    ctx.settings.fireworks_api_key = (
+        SecretStr(snap.fireworks_api_key) if snap.fireworks_api_key else None
+    )
+    ctx.settings.mode = snap.mode
     ctx.settings.ollama_model = snap.ollama_model
     ctx.settings.anthropic_model = snap.anthropic_model
     ctx.settings.anthropic_api_key = (
@@ -395,6 +456,11 @@ async def _commit(
 
     # 2) Scalar settings (in-memory).
     ctx.settings.provider = pending.provider  # type: ignore[assignment]
+    ctx.settings.fireworks_model = pending.fireworks_model
+    ctx.settings.fireworks_api_key = (
+        SecretStr(pending.fireworks_api_key) if pending.fireworks_api_key else None
+    )
+    ctx.settings.mode = pending.mode
     ctx.settings.ollama_model = pending.ollama_model
     ctx.settings.anthropic_model = pending.anthropic_model
     ctx.settings.anthropic_api_key = (
@@ -407,6 +473,8 @@ async def _commit(
 
     needs_model_rebuild = (
         pending.provider != original.provider
+        or pending.fireworks_model != original.fireworks_model
+        or pending.fireworks_api_key != original.fireworks_api_key
         or pending.ollama_model != original.ollama_model
         or pending.anthropic_model != original.anthropic_model
         or pending.anthropic_api_key != original.anthropic_api_key
@@ -433,6 +501,8 @@ async def _commit(
         save_user_settings(ctx.settings)
         if pending.anthropic_api_key != original.anthropic_api_key:
             save_secret_api_key(pending.anthropic_api_key)
+        if pending.fireworks_api_key != original.fireworks_api_key:
+            save_secret_api_key(pending.fireworks_api_key, "fireworks_api_key")
     except OSError as exc:
         render_error(
             console,
@@ -449,7 +519,10 @@ def _render_diff(console: "Console", before: _Snapshot, after: _Snapshot) -> Non
 
     fields = [
         ("workspace",        before.workspace_name,    after.workspace_name),
+        ("mode",             before.mode or "off",     after.mode or "off"),
         ("provider",         before.provider,          after.provider),
+        ("fireworks_model",  before.fireworks_model,   after.fireworks_model),
+        ("fireworks_api_key", _mask(before.fireworks_api_key), _mask(after.fireworks_api_key)),
         ("ollama_model",     before.ollama_model,      after.ollama_model),
         ("anthropic_model",  before.anthropic_model,   after.anthropic_model),
         ("anthropic_api_key", _mask(before.anthropic_api_key), _mask(after.anthropic_api_key)),

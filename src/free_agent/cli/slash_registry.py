@@ -21,6 +21,10 @@ SLASH_COMMANDS: list[tuple[str, str]] = [
     ("/tools",        "tool inventory (PKG vs USER)"),
     ("/agent",        "current agent profile (main + subagents)"),
 
+    ("/mode list",    "list preset modes (code · science · security · finance)"),
+    ("/mode use",     "activate a mode: /mode use <name>"),
+    ("/mode off",     "back to the plain agent"),
+
     ("/sub new",      "wizard — create a subagent (LLM drafts the prompt)"),
     ("/sub rm",       "remove a subagent: /sub rm <name>"),
     ("/sub list",     "alias for /agent"),
@@ -38,7 +42,7 @@ SLASH_COMMANDS: list[tuple[str, str]] = [
     ("/skill open",   "open skills folder: [project | global | both]"),
     ("/skill dir",    "print skill folder paths"),
 
-    ("/model list",   "list local Ollama models"),
+    ("/model list",   "list models (Fireworks live catalog / local Ollama)"),
     ("/model browse", "browse ollama.com/library [query | all | refresh]"),
     ("/model pull",   "download a model: /model pull <name>"),
     ("/model use",    "switch active model: /model use <name>"),
@@ -103,7 +107,23 @@ def _workspace_names(ctx: "SessionContext") -> Iterable[tuple[str, str]]:
     return out
 
 
+def _mode_names(ctx: "SessionContext") -> Iterable[tuple[str, str]]:
+    from free_agent.modes import MODES
+
+    yield ("off", "plain agent")
+    for m in MODES.values():
+        yield (m.name, ("active · " if m.name == ctx.settings.mode else "") + m.title)
+
+
+def _fireworks_models(ctx: "SessionContext") -> Iterable[tuple[str, str]]:
+    from free_agent.cli.settings_panel import FIREWORKS_MODELS
+
+    return ((name, "fireworks · " + _truncate(note, 50)) for name, note in FIREWORKS_MODELS)
+
+
 _DYNAMIC: dict[str, _DynamicProvider] = {
+    "/mode use ":     _mode_names,
+    "/model use ":    _fireworks_models,
     "/sub rm ":       _subagent_names,
     "/sub remove ":   _subagent_names,
     "/tool rm ":      _user_tool_names,

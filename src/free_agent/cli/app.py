@@ -141,6 +141,8 @@ async def run(
         "  OK  ",
         f"agent online → {settings.active_model} @ {settings.provider}",
     )
+    if settings.mode:
+        await type_boot_line(console, " MODE ", f"preset mode → {settings.mode}  (/mode list)")
     if writable_root is not None:
         await type_boot_line(
             console,
@@ -162,6 +164,11 @@ async def run(
         ws = ctx.workspace.name
         model = ctx.settings.active_model
         provider = ctx.settings.provider
+        mode = (
+            f'<b>mode</b>:<style fg="ansiyellow">{ctx.settings.mode}</style> · '
+            if ctx.settings.mode
+            else ""
+        )
         if ctx.writable_root is not None:
             wrt = (
                 '<style fg="ansired" bg="default"><b>WRT</b></style> '
@@ -171,9 +178,10 @@ async def run(
             wrt = '<style fg="ansigreen"><b>RO</b></style> <style fg="ansibrightblack">virtual fs</style>'
         return HTML(
             f' <b>ws</b>:<style fg="ansimagenta">{ws}</style> · '
+            f'{mode}'
             f'<b>{model}</b><style fg="ansibrightblack">@{provider}</style> · '
             f'{wrt} · '
-            f'<style fg="ansibrightblack">/settings · /ws · ctrl+d quit</style> '
+            f'<style fg="ansibrightblack">/mode · /settings · /ws · ctrl+d quit</style> '
         )
 
     session: PromptSession[str] = PromptSession(

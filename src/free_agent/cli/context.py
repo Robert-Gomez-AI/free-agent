@@ -35,7 +35,10 @@ class SessionContext:
 
         Reuses the existing chat_model and writable_root so this is cheap (no network)."""
         self.agent = assemble_agent(
-            self.chat_model, self.profile, writable_root=self.writable_root
+            self.chat_model,
+            self.profile,
+            writable_root=self.writable_root,
+            mode=self.settings.mode,
         )
 
     def switch_model(self, new_model: str, *, provider: str | None = None) -> None:
@@ -48,17 +51,22 @@ class SessionContext:
         Reverts every mutation on failure so the session keeps working with
         the previous configuration.
         """
+        from free_agent.config import PROVIDERS, normalize_fireworks_model
+
         old_provider = self.settings.provider
         old_ollama = self.settings.ollama_model
         old_anthropic = self.settings.anthropic_model
+        old_fireworks = self.settings.fireworks_model
 
         target_provider = provider or self.settings.provider
-        if target_provider not in ("ollama", "anthropic"):
+        if target_provider not in PROVIDERS:
             raise ValueError(f"unknown provider: {target_provider!r}")
 
         self.settings.provider = target_provider  # type: ignore[assignment]
         if target_provider == "ollama":
             self.settings.ollama_model = new_model
+        elif target_provider == "fireworks":
+            self.settings.fireworks_model = normalize_fireworks_model(new_model)
         else:
             self.settings.anthropic_model = new_model
 
@@ -69,6 +77,7 @@ class SessionContext:
             self.settings.provider = old_provider  # type: ignore[assignment]
             self.settings.ollama_model = old_ollama
             self.settings.anthropic_model = old_anthropic
+            self.settings.fireworks_model = old_fireworks
             raise
 
         # Persist on success — same convention as the /settings panel, so
@@ -80,6 +89,30 @@ class SessionContext:
         except OSError as exc:
             log = __import__("logging").getLogger(__name__)
             log.warning("model switch applied but could not be persisted: %s", exc)
+
+    def switch_mode(self, name: str | None) -> None:
+        """Activate a preset mode (or `None`/`off` for the plain agent).
+
+        Cheap — reuses the chat model. Reverts on failure; persists on success.
+        """
+        from free_agent.config import save_user_settings
+        from free_agent.modes import get_mode
+
+        mode = get_mode(name)  # raises ValueError on unknown names
+        old_mode = self.settings.mode
+        self.settings.mode = mode.name if mode else ""
+        try:
+            self.rebuild_agent()
+        except Exception:
+            self.settings.mode = old_mode
+            self.rebuild_agent()
+            raise
+        try:
+            save_user_settings(self.settings)
+        except OSError as exc:
+            __import__("logging").getLogger(__name__).warning(
+                "mode switch applied but could not be persisted: %s", exc
+            )
 
     def switch_workspace(self, ws: Workspace) -> None:
         """Activate a different workspace. Reloads profile + tools + skills.

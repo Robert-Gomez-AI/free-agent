@@ -10,7 +10,11 @@ from typing import Any, Literal
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
-Provider = Literal["ollama", "anthropic"]
+Provider = Literal["fireworks", "ollama", "anthropic"]
+PROVIDERS: tuple[str, ...] = ("fireworks", "ollama", "anthropic")
+
+FIREWORKS_MODEL_PREFIX = "accounts/fireworks/models/"
+DEFAULT_FIREWORKS_MODEL = FIREWORKS_MODEL_PREFIX + "kimi-k3"
 
 log = logging.getLogger(__name__)
 
@@ -29,7 +33,7 @@ SECRETS_FILE = CONFIG_ROOT / "secrets.json"
 
 # Field names that belong in secrets.json instead of settings.json. The
 # settings panel and persistence helpers route them accordingly.
-_SECRET_FIELDS = frozenset({"anthropic_api_key"})
+_SECRET_FIELDS = frozenset({"anthropic_api_key", "fireworks_api_key"})
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -105,7 +109,15 @@ class Settings(BaseSettings):
         populate_by_name=True,
     )
 
-    provider: Provider = Field("ollama", alias="FREE_AGENT_PROVIDER")
+    # Fireworks is the standard provider: hosted open-weight models with
+    # tool calling, no local GPU needed. Ollama and Anthropic stay available.
+    provider: Provider = Field("fireworks", alias="FREE_AGENT_PROVIDER")
+
+    fireworks_model: str = Field(DEFAULT_FIREWORKS_MODEL, alias="FREE_AGENT_FIREWORKS_MODEL")
+    fireworks_api_key: SecretStr | None = Field(None, alias="FIREWORKS_API_KEY")
+    fireworks_base_url: str = Field(
+        "https://api.fireworks.ai/inference", alias="FREE_AGENT_FIREWORKS_BASE_URL"
+    )
 
     ollama_model: str = Field("qwen2.5:7b", alias="FREE_AGENT_OLLAMA_MODEL")
     ollama_base_url: str = Field("http://localhost:11434", alias="FREE_AGENT_OLLAMA_BASE_URL")
@@ -126,6 +138,10 @@ class Settings(BaseSettings):
     # cannot escape via .. / ~ / absolute outside-root). Defaults to False, in
     # which case files live in the in-memory deepagents StateBackend.
     writable: bool = Field(False, alias="FREE_AGENT_WRITABLE")
+
+    # Preset mode (see free_agent.modes): "" = plain agent, or one of
+    # code / science / security / finance.
+    mode: str = Field("", alias="FREE_AGENT_MODE")
 
     @classmethod
     def settings_customise_sources(
@@ -161,10 +177,22 @@ class Settings(BaseSettings):
 
     @property
     def active_model(self) -> str:
+        if self.provider == "fireworks":
+            return self.fireworks_model
         return self.ollama_model if self.provider == "ollama" else self.anthropic_model
 
     @model_validator(mode="after")
     def _check_provider_credentials(self) -> Settings:
+        self.fireworks_model = normalize_fireworks_model(self.fireworks_model)
+        if self.provider == "fireworks":
+            key = self.fireworks_api_key
+            if key is None or not key.get_secret_value().strip():
+                raise ValueError(
+                    "FIREWORKS_API_KEY is required when FREE_AGENT_PROVIDER=fireworks "
+                    "(the default). Get one at https://fireworks.ai/account/api-keys and set "
+                    f"it via /settings, the FIREWORKS_API_KEY env var / .env, or {SECRETS_FILE}. "
+                    "To run fully local instead, set FREE_AGENT_PROVIDER=ollama."
+                )
         if self.provider == "anthropic":
             key = self.anthropic_api_key
             if key is None or not key.get_secret_value().strip():
@@ -176,6 +204,18 @@ class Settings(BaseSettings):
         return self
 
 
+def normalize_fireworks_model(name: str) -> str:
+    """Expand short Fireworks ids: `kimi-k3` → `accounts/fireworks/models/kimi-k3`.
+
+    Full ids (`accounts/<acct>/models/<m>`, `accounts/<acct>/routers/<r>`,
+    `accounts/<acct>/deployedModels/<d>`) and a `fireworks:` prefix are accepted.
+    """
+    n = name.strip().removeprefix("fireworks:").strip()
+    if not n or n.startswith("accounts/"):
+        return n
+    return FIREWORKS_MODEL_PREFIX + n
+
+
 # ─── persistence helpers (used by the settings panel) ───────────────────────
 
 
@@ -184,11 +224,13 @@ class Settings(BaseSettings):
 # belong in a per-user prefs file.
 _PERSISTABLE_FIELDS = (
     "provider",
+    "fireworks_model",
     "ollama_model",
     "anthropic_model",
     "temperature",
     "max_tokens",
     "writable",
+    "mode",
 )
 
 
@@ -201,16 +243,19 @@ def save_user_settings(settings: Settings) -> Path:
     return SETTINGS_FILE
 
 
-def save_secret_api_key(key: str | None) -> Path:
-    """Write (or clear) the Anthropic API key in secrets.json with mode 0600.
+def save_secret_api_key(key: str | None, field: str = "anthropic_api_key") -> Path:
+    """Write (or clear) an API key in secrets.json with mode 0600.
 
-    Pass `None` or an empty string to remove the persisted key.
+    `field` is the settings field name (`anthropic_api_key` or
+    `fireworks_api_key`). Pass `None` or an empty string to remove it.
     """
+    if field not in _SECRET_FIELDS:
+        raise ValueError(f"not a secret field: {field!r}")
     existing = _read_json(SECRETS_FILE)
     if key is None or not key.strip():
-        existing.pop("anthropic_api_key", None)
+        existing.pop(field, None)
     else:
-        existing["anthropic_api_key"] = key.strip()
+        existing[field] = key.strip()
     _atomic_write_json(SECRETS_FILE, existing, mode=stat.S_IRUSR | stat.S_IWUSR)
     return SECRETS_FILE
 

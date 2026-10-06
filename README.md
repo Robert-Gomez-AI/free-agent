@@ -2,21 +2,27 @@
 
 A terminal-first base for building local agent and multi-agent systems on top
 of LangChain's [deepagents](https://docs.langchain.com/oss/python/deepagents/overview).
-Bring your own LLM (Ollama, Anthropic, ...), your own tools (Python `@tool`
-functions), and your own agents (declared in YAML or built interactively from
-the chat).
+Bring your own LLM (Fireworks AI by default, Ollama, Anthropic), your own
+tools (Python `@tool` functions), and your own agents (declared in YAML or
+built interactively from the chat) — or start from one of the four preset
+**modes**: code, science, security, finance.
 
 ```
 ░▒▓ neural shell :: deepagents runtime :: zero leash ▓▒░
- NET online   MODEL qwen3.5:9b   LINK ollama
+ NET online   MODEL accounts/fireworks/models/kimi-k3   LINK fireworks
 ```
 
 ![free-agent in action](images/image.png)
 
 ## What you get
 
-- **Local-first.** Runs against any local Ollama model with tool calling
-  (Qwen, Llama 3.1+, Mistral, GLM, ...) or Anthropic's API. Pick per project.
+- **Fireworks AI as the standard provider.** Hosted open-weight models with
+  tool calling (Kimi K3, GLM 5.3, DeepSeek V4.1, Qwen, gpt-oss, …) — no GPU
+  needed. Local Ollama models and Anthropic's API remain one `/model use` away.
+- **Preset modes with specialized tools.** `/mode use code | science |
+  security | finance` swaps in a domain system prompt and a tool pack
+  (Claude-Code-style repo editing, arXiv/PubMed/Crossref search, CVE lookup
+  and artifact triage, market data and NPV/IRR/risk analytics).
 - **Streaming chat REPL** with cyberpunk styling, slash commands, history,
   Ctrl+C cancel, Ctrl+D quit.
 - **In-chat settings panel.** `/settings` opens your `$EDITOR` with a
@@ -117,14 +123,77 @@ When enabled:
 > can review the diff. For higher-risk environments, leave it off; the
 > in-memory backend is enough for most chat use cases.
 
+## Preset modes
+
+A mode is a specialized agent: a domain system prompt + a tool pack (+ subagents
+for `code`). It layers on top of your workspace profile — your own tools,
+subagents and `system_prompt` (appended as "workspace instructions") still apply.
+
+| mode | for | specialized tools |
+|---|---|---|
+| `code` | Claude-Code-style software engineering in your repo | `project_overview`, `view_file`, `glob_files`, `grep_code` (ripgrep), `str_replace`, `create_file`, `git_inspect` (read-only git) + subagents `code-explorer`, `code-reviewer` |
+| `science` | literature review, data analysis, technical writing | `arxiv_search`, `pubmed_search`, `crossref_lookup` (DOI → citation), `python_compute`, `stats_summary` (mean/sd/95% CI/quartiles), `linear_fit` (OLS with SE and R²) |
+| `security` | defensive security: threat intel, triage, posture checks | `cve_lookup` (NVD: CVSS, CWE, CISA KEV), `extract_iocs`, `hash_data`, `codec_transform`, `jwt_inspect`, `http_security_headers`, `tls_certificate_info`, `dns_lookup`, `password_strength` |
+| `finance` | markets, corporate & personal finance, risk | `market_quote` (Yahoo Finance), `fx_convert` (ECB rates), `time_value_of_money`, `loan_schedule`, `cash_flow_analysis` (NPV/IRR/payback/PI), `portfolio_risk` (vol, Sharpe, Sortino, drawdown, VaR/CVaR), `python_compute` |
+
+```
+/mode list            catalog with the active mode marked
+/mode use finance     activate (Spanish aliases work: finanzas, ciencia, ciberseguridad, codigo)
+/mode off             back to the plain agent
+free-agent --mode code    start a session directly in a mode
+```
+
+The active mode is persisted in `settings.json` (`mode` field, also editable
+from `/settings` or `FREE_AGENT_MODE`). All tools are stdlib-only and use
+free, keyless public APIs. Notes:
+
+- **code** reads from the writable root (or cwd); `str_replace` / `create_file`
+  only work after `/writable on` and can't escape the writable root.
+- **security** tools are passive or single-target inspection — no scanning or
+  exploitation. Only point them at systems you're authorized to assess.
+- **finance** output is analysis, not investment advice; market data may be delayed.
+
+Mode tools can also be used without a mode: list them by name in a
+workspace profile's `tools:` (main agent or subagent).
+
 ## Pick a model provider
 
 Easiest path: launch `free-agent`, type `/settings`, edit the YAML, save.
 Persisted to `~/.config/free-agent/settings.json` so the next session boots
-into your choice. Or set `FREE_AGENT_PROVIDER` / `ANTHROPIC_API_KEY` env
-vars for the same effect (env wins over the JSON files).
+into your choice. Or set `FREE_AGENT_PROVIDER` / `FIREWORKS_API_KEY` /
+`ANTHROPIC_API_KEY` env vars for the same effect (env wins over the JSON files).
 
-### Ollama (local, open-source) — default
+### Fireworks AI (cloud, open-weight models) — default
+
+1. Create an API key at [fireworks.ai/account/api-keys](https://fireworks.ai/account/api-keys).
+2. Provide it in any of these ways:
+   - `.env` in the directory you launch from: `FIREWORKS_API_KEY=fw_...`
+   - `export FIREWORKS_API_KEY=fw_...`
+   - just run `free-agent` — on first run without a key it asks for one and
+     saves it to `~/.config/free-agent/secrets.json` (mode `0600`). Press
+     Enter there to fall back to local Ollama instead.
+   - `/settings` → `fireworks_api_key:`
+3. Pick a model (default `accounts/fireworks/models/kimi-k3`):
+
+```
+/model list                 live serverless catalog for your key (⚙ = tool calling)
+/model use glm-5p3          short ids expand to accounts/fireworks/models/<id>
+/model use accounts/fireworks/routers/kimi-k3-fast
+/model use fireworks:<id>   force Fireworks when another provider is active
+free-agent --model deepseek-v4p1-flash
+```
+
+Any `accounts/<account>/models|routers|deployedModels/<id>` works, so
+fine-tuned models and dedicated deployments plug in the same way. Pick
+models with tool-calling support — the agent relies on it.
+
+| env var | default |
+|---|---|
+| `FIREWORKS_API_KEY` | — (required for this provider) |
+| `FREE_AGENT_FIREWORKS_MODEL` | `accounts/fireworks/models/kimi-k3` |
+| `FREE_AGENT_FIREWORKS_BASE_URL` | `https://api.fireworks.ai/inference` |
+
+### Ollama (local, open-source)
 
 > **Heads up:** `uv tool install free-agent` installs the Python CLI, **not
 > Ollama itself**. Ollama is a separate native daemon that runs on your
@@ -141,7 +210,8 @@ vars for the same effect (env wins over the JSON files).
    ```
    …or pull from inside the chat with `/model pull qwen3.5:9b` (see below).
 3. From inside the chat, `/settings` → set `provider: ollama` and
-   `ollama_model: qwen3.5:9b`. Save and quit your editor.
+   `ollama_model: qwen3.5:9b`. Save and quit your editor. (Or launch with
+   `free-agent --provider ollama --model qwen3.5:9b`, or `/model use ollama:qwen3.5:9b`.)
 
 The boot sequence does a preflight against Ollama and lists what you have if
 the configured model isn't pulled — so a misconfigured model fails fast with
@@ -204,8 +274,9 @@ survives. Reverts cleanly if the new model fails preflight. The chosen
 provider + model is persisted to `~/.config/free-agent/settings.json`, so
 the next session boots into whatever you last picked.
 
-`/model browse`, `/model pull`, `/model rm`, `/model list` only apply to
-Ollama (cloud catalogs aren't browsed/pulled). `/model use` works for both.
+`/model browse`, `/model pull`, `/model rm` only apply to Ollama.
+`/model list` shows the Fireworks live catalog when Fireworks is active.
+`/model use` works across all three providers.
 
 ### Anthropic (cloud)
 
@@ -489,10 +560,13 @@ and edit by hand instead.
 ## CLI flags
 
 ```
-free-agent [-w] [-c PATH] [--version]
+free-agent [-w] [-c PATH] [-m MODE] [--provider P] [--model NAME] [--version]
 
   -w, --writable        let the agent modify files in cwd (scoped, see above)
   -c, --config PATH     use a specific YAML profile (default: ./free-agent.yaml)
+  -m, --mode MODE       start in a preset mode: code | science | security | finance | off
+  --provider P          fireworks (default) | ollama | anthropic, for this run
+  --model NAME          model id for this run (e.g. glm-5p3, qwen3.5:9b)
   --version             print version and exit
   -h, --help            show this help
 ```
@@ -542,6 +616,9 @@ progresses.
 /plan <task>       force the agent to write_todos before acting on the task
 /tools             tool inventory (PKG vs USER)
 /agent             current agent profile (main + subagents)
+/mode list         preset modes (code · science · security · finance)
+/mode use <name>   activate a mode — specialized prompt + tools
+/mode off          back to the plain agent
 /sub new           wizard — create a subagent
 /sub rm <name>     remove a subagent
 /tool new          wizard — create a tool
@@ -555,7 +632,7 @@ progresses.
 /skill reload      rebuild after manual edits
 /skill open [s]    open the skills folder in your file manager
 /skill dir         print skill folder paths
-/model list        list local Ollama models
+/model list        Fireworks live catalog, or local Ollama models
 /model browse [q]  curated catalog of pullable models (filter optional)
 /model pull <name> download a model (live progress)
 /model use [name]  switch active model — no name opens an interactive picker
@@ -586,18 +663,21 @@ src/free_agent/
 ├── __main__.py           # entrypoint: load .env, start the async loop
 ├── config.py             # pydantic-settings — JSON + env merge with priority
 ├── workspace.py          # ~/.config/free-agent/workspaces/* lifecycle
+├── modes.py              # preset modes: prompts + tool packs + subagents
 ├── agent/
 │   ├── builder.py        # the only file that imports deepagents
 │   ├── profile.py        # AgentProfile / SubAgentProfile (Pydantic)
 │   ├── loader.py         # free-agent.yaml → AgentProfile (with save)
 │   ├── prompts.py        # default system prompt fallback
 │   ├── skills_registry.py # discover SKILL.md folders (project + global)
+│   ├── fireworks_catalog.py # live Fireworks /v1/models listing
 │   ├── ollama_admin.py   # list/pull/delete via Ollama HTTP API
 │   ├── ollama_catalog.py # curated fallback list
 │   └── ollama_library.py # scrape ollama.com/library with cache
 ├── tools/
 │   ├── basic.py          # BUILTIN_TOOLS — what ships with the package
 │   ├── registry.py       # TOOLS (mutable) + reload from workspace + global dirs
+│   ├── domains/          # mode tool packs: code · science · security · finance
 │   └── __init__.py       # public surface
 ├── session/
 │   └── history.py        # plain-dataclass conversation state

@@ -341,6 +341,7 @@ def render_model_picker(
     grid.add_column(style="grey50")                              # note
 
     provider_styles = {
+        "fireworks": "bold orange1",
         "anthropic": "bold bright_magenta",
         "ollama":    "bold bright_green",
     }
@@ -667,6 +668,55 @@ def render_tools_inventory(
             padding=(0, 2),
         )
     )
+
+
+def render_modes(console: Console, modes: list[Any], *, active: str) -> None:
+    """Render the preset-mode catalog with the active one marked."""
+    from rich.console import Group
+    from rich.table import Table
+
+    grid = Table.grid(padding=(0, 2))
+    grid.add_column(style="bold bright_cyan", no_wrap=True)
+    grid.add_column(no_wrap=True)
+    grid.add_column(style="grey70")
+    grid.add_row(
+        " ▶" if not active else "  ",
+        Text("off", style="bold yellow1"),
+        "plain agent — workspace profile only",
+    )
+    for m in modes:
+        grid.add_row(
+            " ▶" if m.name == active else "  ",
+            Text(m.name, style="bold yellow1"),
+            f"{m.title} — {m.description}",
+        )
+        grid.add_row("", "", Text("tools: " + ", ".join(m.tool_names), style="grey50"))
+    console.print(
+        Panel(
+            Group(Text(), grid, Text(), Text("  /mode use <name> · /mode off", style="grey50")),
+            border_style="bright_cyan",
+            title="[tag.cyan] ▓▒░ MODES ░▒▓ [/]",
+            title_align="left",
+            padding=(0, 2),
+        )
+    )
+
+
+def render_mode_tools(console: Console, mode: Any) -> None:
+    """Render the specialized tools contributed by the active mode."""
+    from rich.table import Table
+
+    header = Text()
+    header.append(f" ▰ MODE:{mode.name.upper()} ", style="tag.yellow")
+    header.append(f"  {mode.title} tool pack", style="grey50")
+    grid = Table.grid(padding=(0, 2))
+    grid.add_column(style="bold orange1", no_wrap=True)
+    grid.add_column(style="grey70")
+    for tool in mode.tools:
+        grid.add_row(f"  {_format_signature(tool)}", _short_desc(getattr(tool, "description", "")))
+    console.print(header)
+    console.print(grid)
+    console.print()
 
 
 def render_agent_profile(

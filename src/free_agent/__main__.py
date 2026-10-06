@@ -52,6 +52,25 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "-m",
+        "--mode",
+        metavar="NAME",
+        help=(
+            "Start in a preset mode: code, science, security, finance (or off). "
+            "Overrides the persisted mode for this run."
+        ),
+    )
+    p.add_argument(
+        "--provider",
+        choices=["fireworks", "ollama", "anthropic"],
+        help="Model provider for this run (default: fireworks, or the persisted choice).",
+    )
+    p.add_argument(
+        "--model",
+        metavar="NAME",
+        help="Model id for this run, e.g. `glm-5p3` (Fireworks) or `qwen3:8b` (Ollama).",
+    )
+    p.add_argument(
         "--version",
         action="version",
         version=f"free-agent {__version__}",
@@ -59,15 +78,66 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _load_settings(overrides: dict[str, str]) -> Settings:
+    """Build Settings; on a first run without a Fireworks key, offer to paste one.
+
+    The key is saved to ~/.config/free-agent/secrets.json (mode 0600) so the
+    prompt only ever appears once.
+    """
+    try:
+        return Settings(**overrides)
+    except Exception as exc:
+        if "FIREWORKS_API_KEY" not in str(exc) or not sys.stdin.isatty():
+            raise
+    import getpass
+
+    from free_agent.config import save_secret_api_key
+
+    sys.stderr.write(
+        "free-agent uses Fireworks AI as its standard model provider.\n"
+        "Paste your API key (https://fireworks.ai/account/api-keys), or press\n"
+        "Enter to run locally with Ollama instead.\n"
+    )
+    key = getpass.getpass("FIREWORKS_API_KEY: ").strip()
+    if not key:
+        return Settings(**{**overrides, "provider": "ollama"})
+    path = save_secret_api_key(key, "fireworks_api_key")
+    sys.stderr.write(f"saved to {path}\n")
+    return Settings(**overrides)
+
+
 def main() -> int:
     args = _build_parser().parse_args()
 
     load_dotenv()
+    overrides: dict[str, str] = {}
+    if args.provider:
+        overrides["provider"] = args.provider
     try:
-        settings = Settings()
+        settings = _load_settings(overrides)
     except Exception as exc:
         sys.stderr.write(f"config error: {exc}\n")
         return 2
+
+    if args.model:
+        from free_agent.config import normalize_fireworks_model
+
+        if settings.provider == "fireworks":
+            settings.fireworks_model = normalize_fireworks_model(args.model)
+        elif settings.provider == "ollama":
+            settings.ollama_model = args.model
+        else:
+            settings.anthropic_model = args.model
+
+    if args.mode is not None:
+        from free_agent.modes import get_mode
+
+        try:
+            mode = get_mode(args.mode)
+        except ValueError as exc:
+            sys.stderr.write(f"config error: {exc}\n")
+            return 2
+        settings.mode = mode.name if mode else ""
 
     if args.writable:
         settings.writable = True

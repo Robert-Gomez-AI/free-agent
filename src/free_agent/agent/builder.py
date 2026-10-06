@@ -13,17 +13,33 @@ from langchain.agents.middleware.types import AgentMiddleware, ModelRequest, Mod
 from langchain_anthropic import ChatAnthropic
 from langchain_core.language_models import BaseChatModel
 from langchain_core.tools import BaseTool
+from langchain_fireworks import ChatFireworks
 from langchain_ollama import ChatOllama
 
 from free_agent.agent.profile import AgentProfile, SubAgentProfile
 from free_agent.agent.prompts import SYSTEM_PROMPT
 from free_agent.agent.skills_registry import discover_skill_sources, list_skills
 from free_agent.config import Settings
+from free_agent.modes import Mode, all_mode_tools, get_mode
 from free_agent.tools import TOOLS
+from free_agent.tools.domains import set_writable_root
 
 
 def make_chat_model(settings: Settings) -> BaseChatModel:
     """Build a fresh chat model. Performs the Ollama preflight (network)."""
+    if settings.provider == "fireworks":
+        key = settings.fireworks_api_key
+        if key is None or not key.get_secret_value().strip():
+            raise ValueError("FIREWORKS_API_KEY is not set — configure it via /settings.")
+        return ChatFireworks(
+            model=settings.fireworks_model,
+            temperature=settings.temperature,
+            max_tokens=settings.max_tokens,
+            api_key=key.get_secret_value(),
+            # The fireworks SDK appends `/v1` itself — tolerate URLs that include it.
+            base_url=settings.fireworks_base_url.rstrip("/").removesuffix("/v1"),
+            max_retries=3,
+        )
     if settings.provider == "ollama":
         _preflight_ollama(settings.ollama_base_url, settings.ollama_model)
         chat = ChatOllama(
@@ -354,6 +370,7 @@ def assemble_agent(
     profile: AgentProfile,
     *,
     writable_root: Path | None = None,
+    mode: Mode | str | None = None,
 ) -> Any:
     """Wire a deepagents graph from an existing model + profile.
 
@@ -363,8 +380,23 @@ def assemble_agent(
     write_file, ls, edit_file) operate on the real disk rooted there, with
     `virtual_mode=True` blocking traversal outside the root. Otherwise the
     default in-memory StateBackend is used (current behavior).
+
+    `mode` (a Mode or its name) layers a preset — system prompt, specialized
+    tools and subagents — on top of the profile. See free_agent.modes.
     """
-    available: dict[str, BaseTool] = {t.name: t for t in TOOLS}
+    if isinstance(mode, str) or mode is None:
+        mode = get_mode(mode)
+    set_writable_root(writable_root)
+
+    # Mode tool packs are always resolvable by name (so a workspace profile
+    # or subagent can opt into e.g. `cve_lookup` without a mode), but only
+    # bound to the main agent when a mode or profile asks for them.
+    available: dict[str, BaseTool] = {t.name: t for t in all_mode_tools()}
+    available.update({t.name: t for t in TOOLS})
+    if mode is not None:
+        profile = mode.apply(profile, [t.name for t in TOOLS])
+    elif profile.tools is None:
+        profile = profile.model_copy(update={"tools": [t.name for t in TOOLS]})
     main_tools = _resolve_tools(profile.tools, available, scope="main agent")
     subagents = [_build_subagent_spec(sa, available) for sa in profile.subagents]
     system_prompt = profile.system_prompt or SYSTEM_PROMPT
@@ -429,7 +461,7 @@ def build_session(
     if profile is None:
         profile = AgentProfile.default()
     model = make_chat_model(settings)
-    agent = assemble_agent(model, profile, writable_root=writable_root)
+    agent = assemble_agent(model, profile, writable_root=writable_root, mode=settings.mode)
     return model, agent
 
 
